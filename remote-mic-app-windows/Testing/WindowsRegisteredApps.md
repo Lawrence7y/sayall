@@ -1,0 +1,56 @@
+# Windows 注册应用扫描与应用库验收
+
+应用使用 Windows 公开 AppsFolder 接口扫描。扫描、搜索或添加到应用库本身不会启动应用，也不会改变任何按键绑定。
+
+## 自动化检查
+
+```powershell
+.\scripts\ci-preflight.ps1
+cargo test -p sayall-windows registered_apps
+```
+
+使用本机已安装注册应用做前台副作用探针（会切换桌面前台）：
+
+```powershell
+$env:SAYALL_TEST_REGISTERED_APP_TARGET = 'shell:AppsFolder\<AUMID>'
+cargo test -p sayall-windows configured_registered_app_reaches_observed_foreground -- --ignored
+Remove-Item Env:SAYALL_TEST_REGISTERED_APP_TARGET
+```
+
+## 功能验收
+
+- 验证应用库扫描、搜索、多选、全选、扫描失败重试，以及保存、导入和导出。
+- 验证扫描与添加不会自动启动应用或绑定按键。
+- 从应用库选择一个目标绑定到按键后，验证启动路径。
+- 目标未运行时，按一次映射键后窗口应成为前台；目标已运行且被其他窗口遮挡或
+  最小化时再次按映射键，窗口也应恢复并成为前台，不能只在任务栏闪烁。诊断日志
+  应以 `target_result=foreground_observed` 作为成功终态，且现场确认前台窗口是
+  实际主窗口；`SetForegroundWindow` 成功或目标 PID 相同均不足以证明通过。
+- **已运行时再次触发不能新开实例**（2026-10-02 修复）：Word / PowerPoint / WPS
+  这类传统桌面条目，先手动打开一个文档，再按映射键——必须切回已有窗口，不能出现
+  新文档或新实例；对照判据是诊断日志出现
+  `phase=prelaunch_activation result=activated source=app_identity|executable_path|install_directory`
+  且耗时在百毫秒级（未修复时走激活契约约 2 s+ 且 pid 增加）。启动器式条目
+  （实测 WPS：注册项解析到 `ksolaunch.exe`，真正的文档进程在同安装目录的版本
+  子目录）应走 `source=install_directory` 兜底，且不得把同族的表格/演示进程
+  当成目标（`launcher_family_rank` 单测覆盖）。
+- 对同一应用拥有崩溃监视、消息、托盘、隐藏渲染窗口的场景，确认这些辅助
+  窗口不会被主动显示；诊断日志应有 `window_candidate` 的接受或拒绝原因。
+- 对 ChatGPT 检查不再出现空白窄条；对 WorkBuddy 检查冷启动、主窗口已隐藏
+  和闲置后首按不再出现白屏。若白屏仍在实际主窗口发生，单独记录渲染时序。
+- 对 ChatGPT 再执行“点 X 关闭窗口到任务栏 → 菜单键打开”回归：不能把
+  无标题、正常尺寸的 `Chrome_WidgetWin_1` 预创建窗口显示成白屏；应等待
+  有标题的实际主窗口并确认其成为前台。
+- 对 MSIX/Electron 等多进程应用，验收按精确 AUMID 关联整组进程，不能只把激活
+  契约返回的单个 PID 当作主窗口进程。
+- 对 AppsFolder 中的传统桌面条目，验收应从 `System.Link.TargetParsingPath` 读取公开
+  的真实目标路径，并按完整进程映像路径关联窗口；不能把 `ShellExecuteExW` 返回的
+  启动器/中转 PID 当作最终应用身份，也不能只按容易碰撞的 exe 文件名匹配。
+- 至少各选一个打包应用和传统桌面应用执行前台锁探针：让独立进程先持有
+  foreground lock，再从后台触发映射。两类目标都必须以
+  `target_result=foreground_observed` 结束。
+- 物理 Alt 正在按住时触发映射，应用不得注入 Alt UP 破坏用户键态；日志应记录
+  `physical_alt_held=true`，若 Windows 因此前台拒绝则明确失败，不得误报成功。
+- 分别用 RC001、RC003 验证实体按键与已有设置保持不变。
+
+RC001/RC003 实体按键回归仍为 `deferred`。

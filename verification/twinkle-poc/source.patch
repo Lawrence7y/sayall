@@ -1,0 +1,882 @@
+diff --git a/ATTRIBUTION.md b/ATTRIBUTION.md
+index 6f57fd3..f1728c5 100644
+--- a/ATTRIBUTION.md
++++ b/ATTRIBUTION.md
+@@ -1,5 +1,11 @@
+ # 来源与归属
+ 
++## Twinkle Tray 全部显示器亮度
++
++- 使用 Twinkle Tray 官方公开 CLI：`--All`、`--Offset`、`--Overlay`；亮度 CLI 从 v1.13.0 起支持，商店调用别名从 v1.17.1 起支持。来源：https://github.com/xanderfrangos/twinkle-tray#command-line-arguments 。只参考公开接口及行为，未复制源码，无新增运行时库依赖，需单独安装并启动 Twinkle Tray。
++- 本机验证版本 1.17.2.0；独立 Rust 探针使用 Windows 公开 `EnumDisplayMonitors`、Physical Monitor 枚举、`GetVCPFeatureAndVCPFeatureReply`（VCP 0x10）确认实际硬件亮度。官方来源：https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-getvcpfeatureandvcpfeaturereply 。不读取第三方私有配置，不直接调用未承诺稳定的内部管道，不注入第三方进程。
++- 100ms 并发 CLI 调用曾未完整累加；串行 `--All` 9 次、本产品后台请求 3 次均完整累加并恢复。故首版保留有界串行任务，禁用按住连发，成功提示只描述请求发送，不把退出码当硬件成功。具体数据与 deferred 边界见 `Testing/WindowsTwinkleBrightness.md`。首版只在 UI 提供全部显示器动作；已有单屏字段兼容保留，不静默扩大旧配置的控制范围。
++
+ ## 2026-10-10 设置窗口按需创建与前端轮询
+ 
+ - 参考 Tauri 2 公开窗口构建/销毁与事件循环接口；关闭界面只销毁 WebView，显式退出才清理 Rust 平台层。源码接口按本地锁文件的 tauri 2.11.5 核对。官方文档：https://v2.tauri.app/reference/javascript/api/namespacewebviewwindow/ 。未复制第三方应用实现。
+diff --git a/TODO.md b/TODO.md
+index eb1150b..c4af56c 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -1,5 +1,9 @@
+ # TODO
+ 
++## Twinkle Tray 显示器亮度
++
++- [ ] 普通按键映射“调亮所有显示器 / 调暗所有显示器”，步长 1–100 个百分点，默认 5；仅调整 Twinkle Tray 可控显示器，不修改默认按键绑定、不参与语音键生命周期、不支持按住连发。界面和后台串行调用已实现；本机 Twinkle Tray 1.17.2 的 `--All` 串行 9 次及产品后台连续 3 次均经 DDC/CI 硬件读回确认并恢复。单屏选择/切换目标不在首版范围；保留已有单屏配置兼容。RC001/RC003 实体按键、多屏不同初始亮度、商店版与睡眠恢复验收仍 deferred，见 `Testing/WindowsTwinkleBrightness.md`。
++
+ ## 2026-10-10 本地性能优化
+ 
+ - [ ] 设置界面按需创建、关闭后释放 WebView，并配合页面懒加载/可见性轮询。实现和本机内存、四页显示、Ctrl+W/标题栏关闭、二次启动重建验证已完成；关闭后 WebView2 数量为 0，主程序组工作集约 65–71 MiB。实际托盘点击及双型号冷态语音、断连/睡眠回归仍待验，未发布或替换原安装版。证据与边界见 `Testing/WindowsWindowMemory.md`。
+diff --git a/Testing/WindowsTwinkleBrightness.md b/Testing/WindowsTwinkleBrightness.md
+new file mode 100644
+index 0000000..40b75d4
+--- /dev/null
++++ b/Testing/WindowsTwinkleBrightness.md
+@@ -0,0 +1,55 @@
++# Twinkle Tray 全部显示器亮度
++
++## 实现范围
++
++普通按键单击、双击、长按可选“调亮所有显示器 / 调暗所有显示器”，每次 1–100 个百分点，默认 5。保存的动作使用 `twinkle_brightness` + `monitor: null`，平台调用官方 CLI `--All --Offset=<signed step> --Overlay`。
++
++首版不提供单屏选择或切换目标；保留原动作字段兼容，旧单屏配置不静默改绑，重新选择全部动作才改成 `monitor: null`。不参与语音键、不修改默认绑定，亮度动作不允许 hold repeat。
++
++后台只有一个执行线程和容量 4 的待执行通道。请求过多明确拒绝，不静默丢弃；每个 CLI 子进程有 5 秒预算，测试命令后台等待完成最多 30 秒；退出取消待执行请求、终止本功能创建的子进程并回收，不终止 Twinkle Tray 主程序。不通过 shell 执行用户命令，日志不含个人路径或显示器身份。
++
++## 自动化
++
++```powershell
++node node_modules/vitest/vitest.mjs run
++node node_modules/vue-tsc/bin/vue-tsc.js --noEmit
++node node_modules/vite/bin/vite.js build
++cargo fmt --all -- --check
++cargo test --workspace
++cargo check --workspace
++cargo check -p sayall-windows-app --features runtime-simulation
++```
++
++本机结果：前端 302 passed / 11 skipped，Rust 全工作区 477 passed / 14 ignored，TypeScript / Vite build / fmt / workspace check / runtime-simulation check 均 passed（有既有编译 warning）。安装包及物理遥控器验收不包含在这些结果内。
++
++覆盖：全部动作及步长保存、单击/双击/长按槽位、没有显示器选择控件、旧单屏配置不静默扩张、测试提示与错误、步长非法值拒绝；Rust 覆盖 signed offset/All 参数、无效配置、序列化往返与禁止重复。
++
++## 本机硬件证据
++
++环境：Twinkle Tray 1.17.2.0，一个可控 DDC/CI 物理显示器（S82），一个 `none` 不可控列表条目。VCP 最大亮度 100，初始 11。证据保存在仓库外 `D:/Project/sayall/verification/twinkle-poc/`，没有归档显示器 ID 或用户配置。
++
++1. 独立 Rust UTF-8 捕获 `--List`、ANSI 清理、字段解析通过；PowerShell 默认解码曾乱码，Rust 明确 UTF-8 不存在该问题。
++2. 单次调亮/调暗经 Windows DDC/CI 读回确认 `11 -> 12 -> 11`。两轮 60 秒闲置后首次调用至硬件读回约 406–438ms。
++3. 100ms 并发三次 +1：第一轮 `11 -> 13`（failed），第二轮 `11 -> 14`（passed）。不能把并发视作可靠或凭样本归因内部机制。
++4. `--All` CLI-only 串行三轮，每轮三次 +1，均 `11 -> 14`，共 9 次请求，退出耗时各 339–455ms；每轮恢复 11 并读回确认。证据 `all-serial.log`。
++5. 编译产品平台模块的 `twinkle_all_probe`，一次提交三个 +1 给真实生产后台任务，三个完成回调返回后由独立 Windows API 探针读回 `11 -> 14`；恢复 `--All --Set=11` 后读回 11。证据 `production-worker.log`。此步骤测试产品后台，而不只是探针直接调用 CLI。
++
++生产探针需显式 `--exercise`，会改变亮度且自身不负责恢复。只应在记录所有屏幕初始值、能可靠恢复时使用。现场包装脚本 `verification/twinkle-poc/test-production-worker.ps1` 仅允许一个可控且可读的物理屏幕，finally 恢复并硬件确认，不能把统一 Set 恢复法用于各屏初始值不同的多屏配置。
++
++“请求已发送”与“硬件已改变”分开。产品不读取第三方内部状态，测试按钮不能仅依据 CLI 退出报告硬件成功。
++
++## 实体遥控器 / 安装包验收（deferred）
++
++RC001 和 RC003 分别执行：
++
++- 安装本地包、启动 Twinkle Tray，先在 Twinkle Tray 确认每块屏幕可以控制。
++- 普通按键分别配置调亮/调暗，步长 1 或 5；测试按钮与物理按键均观察真实亮度变化。
++- 保存、关闭界面、重启后映射保留；导入导出保留亮度动作和步长。
++- 验证三种手势不影响语音键实时开始/结束，不触发键盘/音量等额外动作（受现有按键能力边界约束）。
++- 冷态首用、快速连按、方向反转、队列满后的错误提示；不得因请求正常退出就判定无丢步。
++- 多块可控屏幕设不同初始亮度，用相对 +5/-5 检查各屏分别变化；边界 0/100 不越界；不可控屏幕保持不变。
++- Twinkle Tray 未运行、未安装、执行失败/超时都明确报错。
++- 使用后断连、睡眠唤醒、屏幕重插再试；退出期间待执行任务不复活、不强杀 Twinkle Tray。
++- Microsoft Store 版、自定义安装路径与多屏归一化设置兼容性另行验证；当前可执行定位仅覆盖默认安装路径和商店执行别名。
++
++本机 CLI 与平台后台 passed 不能替代 RC001/RC003 物理按键、多屏、安装升级或正式发行验收。
+diff --git a/crates/sayall-windows/examples/twinkle_all_probe.rs b/crates/sayall-windows/examples/twinkle_all_probe.rs
+new file mode 100644
+index 0000000..8a771ee
+--- /dev/null
++++ b/crates/sayall-windows/examples/twinkle_all_probe.rs
+@@ -0,0 +1,46 @@
++//! Explicit local hardware probe: sends three +1 requests through the production worker.
++//! Run only with --exercise; independently read hardware brightness and restore afterwards.
++#[cfg(windows)]
++fn main() -> Result<(), String> {
++    use sayall_windows::{send_input::ScrollDirection, twinkle_tray};
++    use std::{sync::mpsc, time::Duration};
++    if !std::env::args().any(|arg| arg == "--exercise") {
++        return Err("requires --exercise; changes all controllable displays by +3".into());
++    }
++    struct Shutdown;
++    impl Drop for Shutdown {
++        fn drop(&mut self) {
++            twinkle_tray::shutdown();
++        }
++    }
++    let _shutdown = Shutdown;
++    let (sender, receiver) = mpsc::channel();
++    for operation in 0..3 {
++        let sender = sender.clone();
++        twinkle_tray::request(
++            ScrollDirection::Up,
++            1,
++            None,
++            Box::new(move |result| {
++                let _ = sender.send((operation, result));
++            }),
++        )?;
++    }
++    drop(sender);
++    for _ in 0..3 {
++        let (operation, result) = receiver
++            .recv_timeout(Duration::from_secs(20))
++            .map_err(|_| "completion timeout")?;
++        result?;
++        println!(
++            "production_worker operation={operation} cli_completed=true hardware_changed=unknown"
++        );
++    }
++    Ok(())
++}
++
++#[cfg(not(windows))]
++fn main() {
++    eprintln!("requires Windows");
++    std::process::exit(1);
++}
+diff --git a/crates/sayall-windows/src/button_mapping.rs b/crates/sayall-windows/src/button_mapping.rs
+index 0fbd08e..ed70945 100644
+--- a/crates/sayall-windows/src/button_mapping.rs
++++ b/crates/sayall-windows/src/button_mapping.rs
+@@ -66,6 +66,15 @@ pub enum EngineMessage {
+ 
+ /// 动作注入器抽象（生产实现包装 `SendInputRuntime`，测试实现记录调用）。
+ pub trait MappingInjector: Send + Sync {
++    fn twinkle_brightness(
++        &self,
++        _direction: ScrollDirection,
++        _steps: u16,
++        _monitor: Option<u16>,
++        _completion: crate::twinkle_tray::Completion,
++    ) -> Result<(), String> {
++        Err("当前运行环境不支持 Twinkle Tray 亮度动作".into())
++    }
+     fn tap(&self, chord: &KeyChord) -> Result<(), String>;
+     fn scroll(&self, direction: ScrollDirection, steps: u16) -> Result<(), String>;
+     fn mouse_click(&self, kind: MouseClickKind) -> Result<(), String>;
+@@ -143,6 +152,15 @@ impl SendInputInjector {
+ }
+ 
+ impl MappingInjector for SendInputInjector {
++    fn twinkle_brightness(
++        &self,
++        direction: ScrollDirection,
++        steps: u16,
++        monitor: Option<u16>,
++        completion: crate::twinkle_tray::Completion,
++    ) -> Result<(), String> {
++        crate::twinkle_tray::request(direction, steps, monitor, completion)
++    }
+     fn scroll(&self, direction: ScrollDirection, steps: u16) -> Result<(), String> {
+         self.runtime
+             .scroll(direction, steps)
+@@ -1010,6 +1028,26 @@ fn fire_gesture(
+     }
+     match action {
+         ButtonAction::Disabled => {}
++        ButtonAction::TwinkleBrightness {
++            direction,
++            steps,
++            monitor,
++        } => {
++            crate::ble::gatt_note(format!("map_fire button={button:?} trigger={trigger:?} action=twinkle_brightness direction={direction:?} steps={steps} monitor={}", monitor.map(|number| number.to_string()).unwrap_or_else(|| "all".into())));
++            let completion_state = Arc::clone(state);
++            let completion = Box::new(move |result: Result<(), String>| {
++                if let Err(error) = result {
++                    lock_state(&completion_state).last_error = Some(error);
++                }
++            });
++            if let Err(error) = injector.twinkle_brightness(direction, steps, monitor, completion) {
++                crate::ble::gatt_note(
++                    "twinkle_brightness phase=rejected result=failed reason=request_not_queued"
++                        .into(),
++                );
++                lock_state(state).last_error = Some(error);
++            }
++        }
+         ButtonAction::Scroll { direction, steps } => {
+             crate::ble::gatt_note(format!(
+                 "map_fire button={button:?} trigger={trigger:?} action=scroll direction={direction:?} steps={steps}"
+diff --git a/crates/sayall-windows/src/lib.rs b/crates/sayall-windows/src/lib.rs
+index 49f93be..0f74d26 100644
+--- a/crates/sayall-windows/src/lib.rs
++++ b/crates/sayall-windows/src/lib.rs
+@@ -19,6 +19,7 @@ pub mod battery;
+ mod ble;
+ #[cfg(windows)]
+ mod bluetooth_radio;
++pub mod twinkle_tray;
+ #[cfg(windows)]
+ pub use bluetooth_radio::prepare_bluetooth_radio_recovery;
+ mod button_gestures;
+diff --git a/crates/sayall-windows/src/send_input.rs b/crates/sayall-windows/src/send_input.rs
+index 20f0759..d22b943 100644
+--- a/crates/sayall-windows/src/send_input.rs
++++ b/crates/sayall-windows/src/send_input.rs
+@@ -484,6 +484,17 @@ pub enum ButtonAction {
+         direction: MoveDirection,
+         distance: u16,
+     },
++    TwinkleBrightness {
++        direction: ScrollDirection,
++        #[serde(default = "default_brightness_steps")]
++        steps: u16,
++        #[serde(default)]
++        monitor: Option<u16>,
++    },
++}
++
++fn default_brightness_steps() -> u16 {
++    5
+ }
+ 
+ impl ButtonAction {
+@@ -498,9 +509,11 @@ impl ButtonAction {
+     /// `ButtonMappings::normalized` 在保存时整单拒绝）。
+     pub fn allows_repeat(&self) -> bool {
+         match self {
+-            Self::Disabled | Self::OpenApp { .. } | Self::FocusInput | Self::MouseClick { .. } => {
+-                false
+-            }
++            Self::Disabled
++            | Self::OpenApp { .. }
++            | Self::FocusInput
++            | Self::MouseClick { .. }
++            | Self::TwinkleBrightness { .. } => false,
+             Self::Scroll { .. } | Self::MouseMove { .. } => true,
+             Self::Shortcut { chord } => {
+                 matches!(chord.keys.as_slice(), [key] if !key.is_modifier())
+@@ -849,6 +862,10 @@ impl ButtonMappings {
+                     *chord = chord.clone().validated()?;
+                 }
+                 match action {
++                    ButtonAction::TwinkleBrightness { steps, monitor, .. } => {
++                        crate::twinkle_tray::validate_options(*steps, *monitor)
++                            .map_err(SendInputError::Backend)?;
++                    }
+                     ButtonAction::Scroll { steps, .. } => validate_mouse_amount(*steps, 100)?,
+                     ButtonAction::MouseMove { distance, .. } => {
+                         validate_mouse_amount(*distance, 2000)?
+diff --git a/crates/sayall-windows/src/twinkle_tray.rs b/crates/sayall-windows/src/twinkle_tray.rs
+new file mode 100644
+index 0000000..5f22a35
+--- /dev/null
++++ b/crates/sayall-windows/src/twinkle_tray.rs
+@@ -0,0 +1,317 @@
++//! Twinkle Tray integration uses only its documented command-line interface.
++use crate::send_input::ScrollDirection;
++
++pub type Completion = Box<dyn FnOnce(Result<(), String>) + Send>;
++
++pub fn validate_options(steps: u16, monitor: Option<u16>) -> Result<(), String> {
++    if !(1..=100).contains(&steps) {
++        return Err("亮度调整步长必须为 1 到 100".into());
++    }
++    if monitor == Some(0) {
++        return Err("Twinkle Tray 显示器编号必须从 1 开始".into());
++    }
++    Ok(())
++}
++
++pub fn arguments(
++    direction: ScrollDirection,
++    steps: u16,
++    monitor: Option<u16>,
++) -> Result<Vec<String>, String> {
++    validate_options(steps, monitor)?;
++    let target = monitor
++        .map(|number| format!("--MonitorNum={number}"))
++        .unwrap_or_else(|| "--All".into());
++    let offset = match direction {
++        ScrollDirection::Up => steps as i32,
++        ScrollDirection::Down => -(steps as i32),
++    };
++    Ok(vec![
++        target,
++        format!("--Offset={offset}"),
++        "--Overlay".into(),
++    ])
++}
++
++pub fn request(
++    direction: ScrollDirection,
++    steps: u16,
++    monitor: Option<u16>,
++    completion: Completion,
++) -> Result<(), String> {
++    let arguments = arguments(direction, steps, monitor)?;
++    #[cfg(windows)]
++    {
++        windows_impl::request(arguments, completion)
++    }
++    #[cfg(not(windows))]
++    {
++        let _ = (arguments, completion);
++        Err("亮度控制仅支持 Windows".into())
++    }
++}
++
++pub fn shutdown() {
++    #[cfg(windows)]
++    windows_impl::shutdown();
++}
++
++#[cfg(windows)]
++mod windows_impl {
++    use super::Completion;
++    use std::os::windows::process::CommandExt;
++    use std::path::PathBuf;
++    use std::process::{Command, Stdio};
++    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++    use std::sync::mpsc::{self, SyncSender, TrySendError};
++    use std::sync::Mutex;
++    use std::thread::JoinHandle;
++    use std::time::{Duration, Instant};
++    use windows::Win32::Foundation::CloseHandle;
++    use windows::Win32::System::Diagnostics::ToolHelp::{
++        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
++        TH32CS_SNAPPROCESS,
++    };
++
++    static STOP: AtomicBool = AtomicBool::new(false);
++    static OPERATION: AtomicU64 = AtomicU64::new(1);
++    static RUNNER: Mutex<Option<Runner>> = Mutex::new(None);
++    struct Job {
++        executable: PathBuf,
++        arguments: Vec<String>,
++        operation: u64,
++        completion: Completion,
++    }
++    struct Runner {
++        sender: SyncSender<Job>,
++        thread: JoinHandle<()>,
++    }
++
++    fn running() -> bool {
++        unsafe {
++            let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
++                return false;
++            };
++            let mut entry = PROCESSENTRY32W {
++                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
++                ..Default::default()
++            };
++            let mut exists = false;
++            let mut next = Process32FirstW(snapshot, &mut entry).is_ok();
++            while next {
++                let length = entry
++                    .szExeFile
++                    .iter()
++                    .position(|value| *value == 0)
++                    .unwrap_or(entry.szExeFile.len());
++                let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
++                if name.eq_ignore_ascii_case("Twinkle Tray.exe")
++                    || name.eq_ignore_ascii_case("Twinkle-Tray.exe")
++                {
++                    exists = true;
++                    break;
++                }
++                next = Process32NextW(snapshot, &mut entry).is_ok();
++            }
++            let _ = CloseHandle(snapshot);
++            exists
++        }
++    }
++
++    fn executable() -> Result<PathBuf, String> {
++        let root = std::env::var_os("LOCALAPPDATA")
++            .map(PathBuf::from)
++            .ok_or("无法定位 Twinkle Tray")?;
++        for relative in [
++            "Programs\\twinkle-tray\\Twinkle Tray.exe",
++            "Microsoft\\WindowsApps\\Twinkle-Tray.exe",
++        ] {
++            let path = root.join(relative);
++            if path.is_file() {
++                return Ok(path);
++            }
++        }
++        Err("未找到 Twinkle Tray，请先安装并启动它".into())
++    }
++
++    pub(super) fn request(arguments: Vec<String>, completion: Completion) -> Result<(), String> {
++        if STOP.load(Ordering::Acquire) {
++            return Err("程序正在退出，亮度请求已取消".into());
++        }
++        let executable = executable()?;
++        if !running() {
++            return Err("请先启动 Twinkle Tray，再使用亮度动作".into());
++        }
++        let mut slot = RUNNER.lock().unwrap_or_else(|error| error.into_inner());
++        if STOP.load(Ordering::Acquire) {
++            return Err("程序正在退出，亮度请求已取消".into());
++        }
++        if slot.is_none() {
++            let (sender, receiver) = mpsc::sync_channel::<Job>(4);
++            let thread = std::thread::Builder::new()
++                .name("sayall-brightness".into())
++                .spawn(move || {
++                    while !STOP.load(Ordering::Acquire) {
++                        match receiver.recv_timeout(Duration::from_millis(100)) {
++                            Ok(job) => execute(job),
++                            Err(mpsc::RecvTimeoutError::Timeout) => {}
++                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
++                        }
++                    }
++                while let Ok(job) = receiver.try_recv() {
++                    crate::ble::gatt_note(format!("twinkle_brightness operation_id={} phase=completed result=cancelled reason=shutdown_before_execution brightness_changed=unknown", job.operation));
++                    (job.completion)(Err("亮度请求已取消".into()));
++                    }
++                })
++                .map_err(|_| "无法启动亮度控制任务")?;
++            *slot = Some(Runner { sender, thread });
++        }
++        let operation = OPERATION.fetch_add(1, Ordering::Relaxed);
++        let job = Job {
++            executable,
++            arguments,
++            operation,
++            completion,
++        };
++        match slot.as_ref().unwrap().sender.try_send(job) {
++            Ok(()) => {
++                crate::ble::gatt_note(format!(
++                    "twinkle_brightness operation_id={operation} phase=queued result=accepted"
++                ));
++                Ok(())
++            }
++            Err(TrySendError::Full(_)) => Err("亮度调整请求过多，请稍后再试".into()),
++            Err(TrySendError::Disconnected(_)) => Err("亮度控制任务已停止".into()),
++        }
++    }
++
++    fn execute(job: Job) {
++        let started = Instant::now();
++        let operation = job.operation;
++        if STOP.load(Ordering::Acquire) {
++            crate::ble::gatt_note(format!("twinkle_brightness operation_id={operation} phase=completed result=cancelled reason=shutdown_before_execution brightness_changed=unknown"));
++            (job.completion)(Err("亮度请求已取消".into()));
++            return;
++        }
++        // Never use a shell or user-supplied command text. This child only sends public CLI IPC.
++        let result = Command::new(&job.executable)
++            .args(&job.arguments)
++            .stdin(Stdio::null())
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .creation_flags(0x08000000)
++            .spawn();
++        let Ok(mut child) = result else {
++            crate::ble::gatt_note(format!("twinkle_brightness operation_id={operation} phase=completed result=failed error_code=spawn_failed"));
++            (job.completion)(Err("无法向 Twinkle Tray 发送亮度请求".into()));
++            return;
++        };
++        let (result, code, error) = loop {
++            match child.try_wait() {
++                Ok(Some(status)) if status.success() => break ("unknown", "cli_exited", None),
++                Ok(Some(_)) => {
++                    break (
++                        "failed",
++                        "exit_nonzero",
++                        Some("Twinkle Tray 未接受亮度请求".into()),
++                    )
++                }
++                Err(_) => {
++                    let _ = child.kill();
++                    let _ = child.wait();
++                    break (
++                        "failed",
++                        "wait_failed",
++                        Some("无法确认亮度请求的发送状态".into()),
++                    );
++                }
++                Ok(None) => {}
++            }
++            if STOP.load(Ordering::Acquire) || started.elapsed() >= Duration::from_secs(5) {
++                let cancelled = STOP.load(Ordering::Acquire);
++                // Only terminate the child created above, never the running Twinkle Tray instance.
++                let _ = child.kill();
++                let _ = child.wait();
++                break (
++                    if cancelled { "cancelled" } else { "failed" },
++                    if cancelled { "cancelled" } else { "timeout" },
++                    Some(
++                        if cancelled {
++                            "亮度请求已取消"
++                        } else {
++                            "Twinkle Tray 响应超时"
++                        }
++                        .into(),
++                    ),
++                );
++            }
++            std::thread::sleep(Duration::from_millis(25));
++        };
++        crate::ble::gatt_note(format!("twinkle_brightness operation_id={operation} phase=completed result={result} reason={code} brightness_changed=unknown elapsed_ms={}", started.elapsed().as_millis()));
++        (job.completion)(error.map_or(Ok(()), Err));
++    }
++
++    pub(super) fn shutdown() {
++        STOP.store(true, Ordering::Release);
++        let runner = RUNNER
++            .lock()
++            .unwrap_or_else(|error| error.into_inner())
++            .take();
++        if let Some(runner) = runner {
++            let _ = runner.thread.join();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::send_input::ScrollDirection;
++
++    #[test]
++    fn public_cli_arguments_select_all_or_one_monitor_and_signed_offset() {
++        assert_eq!(
++            arguments(ScrollDirection::Up, 5, None).unwrap(),
++            ["--All", "--Offset=5", "--Overlay"]
++        );
++        assert_eq!(
++            arguments(ScrollDirection::Down, 12, Some(2)).unwrap(),
++            ["--MonitorNum=2", "--Offset=-12", "--Overlay"]
++        );
++    }
++
++    #[test]
++    fn invalid_values_never_produce_a_command() {
++        for step in [0, 101, u16::MAX] {
++            assert!(arguments(ScrollDirection::Up, step, None).is_err());
++        }
++        assert!(arguments(ScrollDirection::Up, 5, Some(0)).is_err());
++    }
++
++    #[test]
++    fn mapping_round_trip_and_validation_preserve_brightness_options() {
++        use crate::raw_input::RemoteButton;
++        use crate::send_input::{ButtonAction, ButtonMappings, ButtonTrigger};
++        let action: ButtonAction = serde_json::from_str(
++            r#"{"type":"twinkle_brightness","direction":"down","steps":7,"monitor":2}"#,
++        )
++        .unwrap();
++        let mut mappings = ButtonMappings::default();
++        mappings.actions.entry(RemoteButton::Up).or_default().long = action.clone();
++        let normalized = mappings.normalized().unwrap();
++        assert_eq!(
++            normalized.action_for(RemoteButton::Up, ButtonTrigger::Long),
++            action
++        );
++        assert!(
++            !action.allows_repeat(),
++            "CLI calls must not be repeated at keyboard repeat rate"
++        );
++        let invalid: ButtonAction =
++            serde_json::from_str(r#"{"type":"twinkle_brightness","direction":"up","steps":0}"#)
++                .unwrap();
++        let mut mappings = normalized;
++        mappings.actions.get_mut(&RemoteButton::Up).unwrap().long = invalid;
++        assert!(mappings.normalized().is_err());
++    }
++}
+diff --git a/docs/installation-and-configuration.md b/docs/installation-and-configuration.md
+index 6e41b6a..45254da 100644
+--- a/docs/installation-and-configuration.md
++++ b/docs/installation-and-configuration.md
+@@ -130,6 +130,14 @@ SayAll 会记住用户选择的遥控器和语音设备，之后启动、临时
+ 
+ 注意：配置双击后，单击需要等待约 0.3 秒来区分双击；长按约 0.55 秒触发。“按住时连续执行”只对单个按键动作生效（组合快捷键、打开应用等只执行一次，不能连续）。语音键不参与普通按键映射。返回、音量+、音量− 三张卡片需要先开启页面顶部的“全按键支持”（每次开启都会弹出系统授权）；关闭时这三张卡片会置灰、不可点击，鼠标悬停可看到原因说明。页面中被禁用的按键是当前 Windows 输入路径的已知边界，不要通过直接编辑配置文件强行开启。
+ 
++### 调节所有显示器亮度
++
++先安装并启动 Twinkle Tray，确认它能调整你的显示器亮度。在“按键映射”中选择普通按键的单击、双击或长按，然后选择“调亮所有显示器”或“调暗所有显示器”。“每次调整”默认是 5 个百分点，可设为 1–100；每块可控屏幕在自己的当前亮度上增加或减少相同步长，不会统一成同一个亮度。
++
++点击“测试亮度”可试一次。显示“亮度请求已发送”后，请观察屏幕是否变化；这个提示本身不表示显示器已经成功调整。Twinkle Tray 不支持的屏幕不会被调整；它未安装或未启动时，会提示先安装或启动。
++
++每次触发只调整一次，暂不支持按住连续调整。不需要选择显示器编号，也不需要设置切换显示器的按键。若之前保存过单屏亮度配置，重新选择上述动作后才会改成控制所有显示器。
++
+ 页面底部可显式保存当前配置，或将按键映射导出为 `.json` 文件后在另一台 Windows 电脑导入。导入会覆盖当前按键映射并立即生效；建议覆盖前先导出备份。Windows 与 macOS 的动作能力和配置契约不同，两端配置文件不能互相导入。
+ 
+ ## 8. 更新、卸载与本地数据
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 7dbf9fa..aa67f84 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -1618,6 +1618,7 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
+     let mut focus_input_count = 0_usize;
+     let mut scroll_count = 0_usize;
+     let mut mouse_count = 0_usize;
++    let mut brightness_count = 0_usize;
+     let mut disabled_count = 0_usize;
+     for actions in mappings.actions.values() {
+         for action in [&actions.single, &actions.double, &actions.long] {
+@@ -1629,12 +1630,13 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
+                 ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
+                     mouse_count += 1
+                 }
++                ButtonAction::TwinkleBrightness { .. } => brightness_count += 1,
+                 ButtonAction::Disabled => disabled_count += 1,
+             }
+         }
+     }
+     format!(
+-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} scroll_count={scroll_count} mouse_count={mouse_count} disabled_cell_count={disabled_count}",
++        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} scroll_count={scroll_count} mouse_count={mouse_count} brightness_count={brightness_count} disabled_cell_count={disabled_count}",
+         mappings.enabled,
+         mappings.actions.len()
+     )
+@@ -1649,6 +1651,36 @@ async fn test_button_mapping(
+     let action = state.platform.button_mappings().action_for(button, trigger);
+     let platform = Arc::clone(&state.platform);
+     match action {
++        ButtonAction::TwinkleBrightness {
++            direction,
++            steps,
++            monitor,
++        } => {
++            // Use Tauri's existing blocking executor; do not block the async command
++            // or add a Tokio dependency solely for a completion callback.
++            tauri::async_runtime::spawn_blocking(move || {
++                let (sender, receiver) = std::sync::mpsc::channel();
++                sayall_windows::twinkle_tray::request(
++                    direction,
++                    steps,
++                    monitor,
++                    Box::new(move |result| {
++                        let _ = sender.send(result);
++                    }),
++                )?;
++                receiver
++                    .recv_timeout(std::time::Duration::from_secs(30))
++                    .map_err(|error| match error {
++                        std::sync::mpsc::RecvTimeoutError::Timeout => "亮度测试响应超时".to_owned(),
++                        std::sync::mpsc::RecvTimeoutError::Disconnected => {
++                            "亮度测试已取消".to_owned()
++                        }
++                    })?
++            })
++            .await
++            .map_err(|_| "无法完成亮度测试，请稍后再试".to_owned())??;
++            Ok(SendInputSnapshot::default())
++        }
+         ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
+             tauri::async_runtime::spawn_blocking(move || platform.test_mouse_action(action))
+                 .await
+@@ -2699,6 +2731,7 @@ fn shutdown_platform_for_exit(app: &tauri::AppHandle) {
+     }
+     let started = std::time::Instant::now();
+     // 按键宿主随退出收尾关闭（幂等；宿主自身 EOF 兜底同样保证不驻留）。
++    sayall_windows::twinkle_tray::shutdown();
+     sayall_windows::key_host::shutdown_global();
+     let platform = app.state::<AppState>().platform.clone();
+     match platform.shutdown_for_exit(GRACEFUL_EXIT_TIMEOUT) {
+diff --git a/src/lib/bridge.ts b/src/lib/bridge.ts
+index 7507772..0ae6554 100644
+--- a/src/lib/bridge.ts
++++ b/src/lib/bridge.ts
+@@ -178,6 +178,7 @@ export type ButtonAction =
+   | { type: "scroll"; direction: "up" | "down"; steps?: number }
+   | { type: "mouse_click"; kind: MouseClickKind }
+   | { type: "mouse_move"; direction: MoveDirection; distance: number }
++  | { type: "twinkle_brightness"; direction: "up" | "down"; steps?: number; monitor?: number | null }
+   | { type: "open_app"; target: string }
+   | { type: "focus_input" };
+ 
+@@ -1572,6 +1573,11 @@ export function actionSummary(action: ButtonAction | undefined): string {
+   }
+   if (action.type === "mouse_click") return mouseClickLabels[action.kind];
+   if (action.type === "mouse_move") return `${mouseMoveLabels[action.direction]} ${action.distance} px`;
++  if (action.type === "twinkle_brightness") {
++    const label = action.direction === "up" ? "调亮显示器" : "调暗显示器";
++    const target = action.monitor == null ? "全部" : `显示器 ${action.monitor}`;
++    return `${label} ${action.steps ?? 5} · ${target}`;
++  }
+   if (action.type === "open_app") {
+     const known = presetAppNames.get(action.target);
+     if (known) return `打开${known}`;
+diff --git a/src/pages/ButtonsPage.test.ts b/src/pages/ButtonsPage.test.ts
+index 176a700..d56a0fd 100644
+--- a/src/pages/ButtonsPage.test.ts
++++ b/src/pages/ButtonsPage.test.ts
+@@ -149,6 +149,7 @@ import {
+   saveButtonMappings,
+   startShortcutCapture,
+   stopShortcutCapture,
++  testButtonMapping,
+ } from "../lib/bridge";
+ import type {
+   ButtonMappings,
+@@ -240,6 +241,7 @@ beforeEach(() => {
+   vi.mocked(subscribeButtonEdges).mockClear();
+   vi.mocked(subscribeButtonGestures).mockClear();
+   vi.mocked(saveButtonMappings).mockClear();
++  vi.mocked(testButtonMapping).mockClear();
+   // mockClear 只清调用记录，**不清实现**：学习输入框的默认实现要在每个用例里重置。
+   vi.mocked(learnFocusTarget).mockClear();
+   vi.mocked(learnFocusTarget).mockResolvedValue({
+@@ -357,6 +359,78 @@ function confirmDialog(page: VueWrapper) {
+ }
+ 
+ describe("buttons mapping page", () => {
++  it.each([0, 1, 2])("binds all-display brightness to gesture cell %i", async (cell) => {
++    const wrapper = await mountPage();
++    const card = wrapper.findAll(".mapping-card").find(item => item.find(".mapping-card-title strong").text() === "电源")!;
++    await card.findAll(".mapping-cell")[cell]!.trigger("click");
++    await flushPromises();
++    await wrapper.findAll(".mapping-editor button").find(button => button.text() === "调亮所有显示器")!.trigger("click");
++    await flushPromises();
++    const trigger = (["single", "double", "long"] as const)[cell]!;
++    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power![trigger]).toEqual({
++      type: "twinkle_brightness", direction: "up", steps: 5, monitor: null,
++    });
++    wrapper.unmount();
++  });
++
++  it("preserves a legacy single-display binding until the user reselects an all-display action", async () => {
++    vi.mocked(getButtonMappings).mockResolvedValueOnce({ enabled: true, actions: {
++      power: { single: { type: "twinkle_brightness", direction: "up", steps: 7, monitor: 2 }, double: { type: "disabled" }, long: { type: "disabled" } },
++    } });
++    const wrapper = await mountPage();
++    const card = wrapper.findAll(".mapping-card").find(item => item.find(".mapping-card-title strong").text() === "电源")!;
++    await card.findAll(".mapping-cell")[0]!.trigger("click");
++    await flushPromises();
++    expect(wrapper.text()).toContain("当前配置仍指定单个显示器");
++    expect(saveButtonMappings).not.toHaveBeenCalled();
++    await wrapper.find('input[aria-label="亮度调整步长"]').setValue("8");
++    await flushPromises();
++    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
++      type: "twinkle_brightness", direction: "up", steps: 8, monitor: 2,
++    });
++    await wrapper.findAll(".mapping-editor button").find(button => button.text() === "调暗所有显示器")!.trigger("click");
++    await flushPromises();
++    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
++      type: "twinkle_brightness", direction: "down", steps: 8, monitor: null,
++    });
++    wrapper.unmount();
++  });
++
++  it("maps brightness gestures to all displays with a custom step and no monitor picker", async () => {
++    const wrapper = await mountPage();
++    const card = wrapper.findAll(".mapping-card").find(item => item.find(".mapping-card-title strong").text() === "电源")!;
++    await card.findAll(".mapping-cell")[1]!.trigger("click");
++    await flushPromises();
++    const choose = async (label: string) => {
++      await wrapper.findAll(".mapping-editor button").find(button => button.text() === label)!.trigger("click");
++      await flushPromises();
++    };
++    await choose("调亮所有显示器");
++    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.double).toEqual({
++      type: "twinkle_brightness", direction: "up", steps: 5, monitor: null,
++    });
++    await wrapper.find('input[aria-label="亮度调整步长"]').setValue("7");
++    expect(wrapper.find('select[aria-label="亮度目标显示器"]').exists()).toBe(false);
++    expect(wrapper.find('input[aria-label="Twinkle Tray 显示器编号"]').exists()).toBe(false);
++    await flushPromises();
++    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.double).toEqual({
++      type: "twinkle_brightness", direction: "up", steps: 7, monitor: null,
++    });
++    await choose("调暗所有显示器");
++    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.double).toMatchObject({ direction: "down" });
++    await choose("测试亮度");
++    expect(testButtonMapping).toHaveBeenCalledWith("power", "double");
++    expect(wrapper.text()).toContain("亮度请求已发送，请确认显示器亮度变化");
++    vi.mocked(testButtonMapping).mockRejectedValueOnce(new Error("请先启动 Twinkle Tray，再使用亮度动作"));
++    await choose("测试亮度");
++    expect(wrapper.text()).toContain("请先启动 Twinkle Tray");
++    const before = vi.mocked(saveButtonMappings).mock.calls.length;
++    await wrapper.find('input[aria-label="亮度调整步长"]').setValue("0");
++    await flushPromises();
++    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(before);
++    expect(wrapper.text()).toContain("请输入 1 到 100 之间的整数");
++    wrapper.unmount();
++  });
+   it("adds scanned apps to the library without changing button bindings", async () => {
+     const wrapper = await mountPage();
+     await flushPromises();
+diff --git a/src/pages/ButtonsPage.vue b/src/pages/ButtonsPage.vue
+index 3a28864..5ef5a29 100644
+--- a/src/pages/ButtonsPage.vue
++++ b/src/pages/ButtonsPage.vue
+@@ -66,6 +66,7 @@ import {
+   type RuntimeSnapshot,
+   type ShortcutCaptureEdge,
+   testAppFocus,
++  testButtonMapping,
+ } from "../lib/bridge";
+ 
+ const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
+@@ -582,6 +583,40 @@ const PRESET_GROUPS: Array<{ label: string; items: Array<{ label: string; keys:
+ ];
+ 
+ const selectedAction = computed(() => editingTarget.value ? actionOf(editingTarget.value.button, editingTarget.value.trigger) : null);
++const brightnessSteps = computed(() => selectedAction.value?.type === "twinkle_brightness" ? selectedAction.value.steps ?? 5 : 5);
++const testingBrightness = ref(false);
++
++async function testBrightness(): Promise<void> {
++  const target = editingTarget.value;
++  if (!target || testingBrightness.value) return;
++  testingBrightness.value = true;
++  try {
++    await saveQueue;
++    if (dirty.value) throw new Error("亮度设置尚未保存成功，请先保存配置");
++    await testButtonMapping(target.button, target.trigger);
++    statusMessage.value = "亮度请求已发送，请确认显示器亮度变化";
++  } catch (error) {
++    statusMessage.value = error instanceof Error ? error.message : String(error);
++  } finally {
++    testingBrightness.value = false;
++  }
++}
++
++function chooseBrightness(direction: "up" | "down"): void {
++  applyAction({ type: "twinkle_brightness", direction, steps: brightnessSteps.value, monitor: null });
++}
++
++function updateBrightnessNumber(event: Event): void {
++  const input = event.target as HTMLInputElement;
++  const value = input.valueAsNumber;
++  if (!Number.isInteger(value) || value < 1 || value > 100) {
++    statusMessage.value = "请输入 1 到 100 之间的整数";
++    input.value = String(brightnessSteps.value);
++    return;
++  }
++  const action = selectedAction.value;
++  if (action?.type === "twinkle_brightness") applyAction({ ...action, steps: value });
++}
+ const scrollSteps = computed(() => selectedAction.value?.type === "scroll" ? selectedAction.value.steps ?? 1 : 1);
+ const moveDistance = computed(() => selectedAction.value?.type === "mouse_move" ? selectedAction.value.distance : 30);
+ const moveSymbols: Record<MoveDirection, string> = { up: "↑", down: "↓", left: "←", right: "→" };
+@@ -1981,6 +2016,25 @@ onUnmounted(() => {
+           </div>
+         </section>
+ 
++        <section class="action-section brightness-actions">
++          <h4 class="action-section-title">Twinkle Tray 亮度</h4>
++          <div class="preset-grid">
++            <button v-for="direction in (['up', 'down'] as const)" :key="direction" class="chip" type="button"
++              :class="{ selected: selectedAction?.type === 'twinkle_brightness' && selectedAction.direction === direction }"
++              @click="chooseBrightness(direction)">{{ direction === 'up' ? '调亮所有显示器' : '调暗所有显示器' }}</button>
++          </div>
++          <template v-if="selectedAction?.type === 'twinkle_brightness'">
++            <label class="mouse-amount">
++              <span>每次调整</span>
++              <input aria-label="亮度调整步长" type="number" min="1" max="100" step="1" :value="brightnessSteps" @change="updateBrightnessNumber" />
++              <span>个百分点</span>
++            </label>
++            <p class="field-note">需要安装并启动 Twinkle Tray。调整所有可控显示器，每次触发只执行一次。</p>
++            <p v-if="selectedAction.monitor != null" class="field-note">当前配置仍指定单个显示器；重新选择调亮或调暗后改为所有显示器。</p>
++            <button type="button" class="chip" :disabled="busy || testingBrightness" @click="testBrightness">{{ testingBrightness ? '正在测试…' : '测试亮度' }}</button>
++          </template>
++        </section>
++
+         <section class="action-section">
+           <h4 class="action-section-title">鼠标滚轮</h4>
+           <div class="preset-grid">

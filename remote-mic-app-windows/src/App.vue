@@ -1,0 +1,190 @@
+<script setup lang="ts">
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue";
+import { startVisiblePoll } from "./lib/visible-poll";
+import Sidebar from "./components/Sidebar.vue";
+import { getOnboardingState, getRuntimeSnapshot, hideMainWindow, type RuntimeSnapshot } from "./lib/bridge";
+import { reportFrontendEvent } from "./lib/frontend-diagnostics";
+import { useAppUpdate } from "./lib/app-update";
+import { ONBOARDING_WIZARD_ENABLED } from "./lib/feature-flags";
+import {
+  detectReloadRecovery,
+  isBrowserReloadAccelerator,
+  isWindowCloseAccelerator,
+  loadPersistedPage,
+  persistActivePage,
+  touchLiveness,
+  type PageId,
+} from "./navigation";
+const SettingsPage = defineAsyncComponent(() => import("./pages/SettingsPage.vue"));
+const ButtonsPage = defineAsyncComponent(() => import("./pages/ButtonsPage.vue"));
+const ConnectionPage = defineAsyncComponent(() => import("./pages/ConnectionPage.vue"));
+const OnboardingPage = defineAsyncComponent(() => import("./pages/OnboardingPage.vue"));
+const PermissionsPage = defineAsyncComponent(() => import("./pages/PermissionsPage.vue"));
+
+const activePage = ref<PageId>(loadPersistedPage() ?? "buttons");
+watch(activePage, (page) => persistActivePage(page));
+const runtime = ref<RuntimeSnapshot | null>(null);
+const loadError = ref("");
+const { bannerVisible, info: updateInfo, dismissBanner, runStartupSilentCheck } = useAppUpdate();
+let stopRuntimePoll: (() => void) | undefined;
+let disposed = false;
+let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
+let initialRuntimeReported = false;
+
+/** 未完成首次设置时进入向导（激活开关见 ONBOARDING_WIZARD_ENABLED）。 */
+const showOnboarding = ref(false);
+
+/**
+ * 运行时仿真冒烟（构建期 `VITE_SAYALL_RUNTIME_SIMULATION=1`）跑的是**主界面**旅程
+ * （`src/runtime-simulation.ts`：连接 / 按键 / 设置等页面 + IPC），不是首启体验。
+ * 它用全新的隔离状态目录启动，状态判定必然走向导；向导一渲染，旅程等待的导航与
+ * 页面就不存在（2026-10-08 CI 实测：`等待 导航"连接" 超时`）。因此该构建下跳过
+ * 向导门禁。真机首启与硬件信号走查（`Testing/run-hardware-signal-script.ps1`，不带
+ * 这个构建标志）不受影响，仍按状态进入向导。
+ */
+const runtimeSimulationBuild = import.meta.env.VITE_SAYALL_RUNTIME_SIMULATION === "1";
+
+function onOnboardingCompleted(): void {
+  showOnboarding.value = false;
+  // 完成后落到「连接」页：先看到四项就绪状态，再开始日常使用。
+  // 完成事件由向导壳在提交成功处上报（带耗时），这里不重复上报。
+  activePage.value = "connection";
+}
+
+/** 设置页「重新运行向导」：向导状态已由设置页重置为进行中，这里切回向导。 */
+function onRestartOnboarding(): void {
+  showOnboarding.value = true;
+}
+
+function handleWindowKeydown(event: KeyboardEvent): void {
+  if (isWindowCloseAccelerator(event)) {
+    if (event.repeat) return;
+    // Ctrl+W 在 WebView2 里是否默认被当浏览器加速键取决于宿主配置，这里一律
+    // 拦下：窗口已在 IPC 返回前隐藏，扩散出去只是把组合键喂给页面里的输入框。
+    // 系统按键重复率下的连发也一并吞掉（见上面的 `repeat` 提前返回）——
+    // 否则窗口重新显示时会收到一串本轮按住产生的关闭请求。
+    event.preventDefault();
+    event.stopPropagation();
+    // The backend releases the window on its event loop and retains the tray/runtime.
+    void hideMainWindow().catch(() => undefined);
+    return;
+  }
+  if (isBrowserReloadAccelerator(event)) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+}
+
+const activeComponent = computed(() => ({
+  buttons: ButtonsPage,
+  connection: ConnectionPage,
+  permissions: PermissionsPage,
+  settings: SettingsPage,
+})[activePage.value]);
+
+// 横幅不在"设置"页重复显示（页面内已有完整更新面板）。
+const updateBannerVisible = computed(
+  () => bannerVisible.value && activePage.value !== "settings",
+);
+
+function showUpdatePage(): void {
+  activePage.value = "settings";
+}
+
+onMounted(async () => {
+  const refreshRuntime = async () => {
+    try {
+      runtime.value = await getRuntimeSnapshot();
+      loadError.value = "";
+      touchLiveness();
+      if (!initialRuntimeReported) {
+        reportFrontendEvent({
+          event: "runtime_snapshot",
+          phase: "completed",
+          result: "passed",
+          reason: "initial_ipc_ready",
+        });
+        initialRuntimeReported = true;
+      }
+    } catch (error) {
+      loadError.value = error instanceof Error ? error.message : String(error);
+      if (!initialRuntimeReported) {
+        reportFrontendEvent({
+          event: "runtime_snapshot",
+          phase: "completed",
+          result: "failed",
+          reason: "initial_ipc_failed",
+        });
+        initialRuntimeReported = true;
+      }
+    }
+  };
+  // 心跳在前次会话仍新鲜 = 本次挂载是渲染进程崩溃后的重载恢复
+  // （Bugs/2026-09-12）；上报后日志可区分冷启动与重载。
+  if (detectReloadRecovery()) {
+    reportFrontendEvent({
+      event: "webview_reload_recovery",
+      phase: "completed",
+      result: "passed",
+      reason: "fresh_liveness_heartbeat",
+    });
+  }
+  window.addEventListener("keydown", handleWindowKeydown, true);
+  // 首次使用向导：读取向导状态决定是否进入向导模式；读取失败不阻断启动
+  // （Rust 侧已记录失败原因，用户仍可用主界面）。仿真冒烟构建跳过（见上方说明）。
+  if (ONBOARDING_WIZARD_ENABLED && !runtimeSimulationBuild) {
+    try {
+      const onboardingState = await getOnboardingState();
+      showOnboarding.value = onboardingState.isActive;
+    } catch {
+      reportFrontendEvent({
+        event: "onboarding",
+        phase: "state_read",
+        result: "failed",
+        reason: "ipc_failed",
+      });
+    }
+  }
+  await refreshRuntime();
+  if (disposed) return;
+  stopRuntimePoll = startVisiblePoll(refreshRuntime, 1_000);
+  // 启动静默检查更新：延迟 3 秒避开 BLE 恢复/设置加载的启动高峰；
+  // 失败完全无声（app-update.ts 内回落 idle，不打扰主功能）。
+  updateCheckTimer = setTimeout(() => {
+    void runStartupSilentCheck();
+  }, 3_000);
+});
+
+onUnmounted(() => {
+  disposed = true;
+  stopRuntimePoll?.();
+  if (updateCheckTimer) clearTimeout(updateCheckTimer);
+  window.removeEventListener("keydown", handleWindowKeydown, true);
+});
+</script>
+
+<template>
+  <OnboardingPage
+    v-if="showOnboarding"
+    :runtime="runtime"
+    @completed="onOnboardingCompleted"
+  />
+  <div v-else class="app-shell">
+    <Sidebar :active-page="activePage" :version="runtime?.appVersion" @select="activePage = $event" />
+    <main class="content">
+      <div v-if="loadError" class="error-banner">无法读取运行状态：{{ loadError }}</div>
+      <div v-if="updateBannerVisible" class="update-banner">
+        <span>发现新版本 {{ updateInfo?.version }}</span>
+        <button type="button" class="link-button" @click="showUpdatePage">查看</button>
+        <button type="button" class="link-button" aria-label="忽略此提醒" @click="dismissBanner">
+          ×
+        </button>
+      </div>
+      <component
+        :is="activeComponent"
+        :runtime="runtime"
+        @restart-onboarding="onRestartOnboarding"
+      />
+    </main>
+  </div>
+</template>

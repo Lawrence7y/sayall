@@ -1,0 +1,122 @@
+### FILE: ATTRIBUTION.md (conflict lines 3-57)
+<<<<<<< D:\Project\sayall\verification\port-local-features\merge\ours
+||||||| D:\Project\sayall\verification\port-local-features\merge\base
+## 2026-10-10 设置窗口按需创建与前端轮询
+
+- 参考 Tauri 2 公开窗口构建/销毁与事件循环接口；关闭界面只销毁 WebView，显式退出才清理 Rust 平台层。源码接口按本地锁文件的 tauri 2.11.5 核对。官方文档：https://v2.tauri.app/reference/javascript/api/namespacewebviewwindow/ 。未复制第三方应用实现。
+- Vue `defineAsyncComponent` 配合动态 import 拆分按键、连接、权限、设置与向导页面，参考：https://vuejs.org/guide/components/async.html 。轮询使用公开 `document.hidden` / `visibilitychange`，有界单次任务不重叠，卸载后不重新启动。
+- 行为、内存口径与真实硬件边界见 `Testing/WindowsWindowMemory.md`。临时现场脚本与采样保留在仓库外，不引入产品或 CI 依赖。
+
+=======
+## 菜单残留窗口修复与亮度替代方案评估（2026-10-12）
+
+- 菜单修复使用 Windows 公开 `ShowWindow`、`IsWindowVisible`、`GetWindowLongPtrW` / `SetWindowLongPtrW` 及 `WS_EX_TOOLWINDOW` / `WS_EX_APPWINDOW` / `WS_EX_NOACTIVATE`。微软文档：https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow 、https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible 、https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles 。`ShowWindow` 返回旧可见性，不能当作操作成功。按锁定 Tauri 2.11.5 / tao 0.35.3 源码核对缓存状态和样式更新行为，原生漂移由受控实验制造并独立读回；不宣称已找出现场首次漂移的具体调用，无新增依赖。
+- 启动不再预建菜单 renderer；第一次请求才创建，之后隐藏复用。关闭清除页面显示类并验证原生隐藏，失败请求销毁，旧回调不关闭新的有效代次。证据与硬件边界见 `Testing/WindowsMenuWindowLifecycle.md`。
+- 亮度替代方案只调研公开能力、不在本轮实现：Twinkle Tray 官方用户热键与 CLI（https://github.com/xanderfrangos/twinkle-tray#features）；微软 DDC/CI `SetMonitorBrightness`（https://learn.microsoft.com/en-us/windows/win32/api/highlevelmonitorconfigurationapi/nf-highlevelmonitorconfigurationapi-setmonitorbrightness）和 WMI `WmiSetBrightness`（https://learn.microsoft.com/en-us/windows/win32/wmicoreprov/wmisetbrightness-method-in-class-wmimonitorbrightnessmethods）。DDC/CI 不保证每台外接屏实现规范，WMI 不保证外接屏支持；热键重复触发/当前目标一致性尚未实测。禁止使用第三方私有 IPC 或编辑私有配置。
+
+## 通信与按键实时路径优化（2026-10-12）
+
+- 使用 Rust 标准库 `sync_channel` / `try_send` 有界非阻塞生产者与 FIFO 工作线程，不引入外部运行依赖、不复制第三方实现。按本机标准库契约核对；官方接口：https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html 。保留既有逐行重开日志文件的双进程轮转约束，队列满聚合计数，退出有界 flush；不承诺异常退出零丢日志。
+- 菜单复用依据锁定版本 Tauri 2.11.5 的 `WebviewWindow::navigate`、`on_page_load`、`hide` 与 `url` 源码接口；沿用本产品的非激活窗口边界。初次页面未加载时等待，不使用 `about:blank` 拼接菜单导航。无外部应用私有接口、无第三方进程注入；显示耗时与实体按键端到端耗时分开记录。
+- Windows 本地日志同步/提交对照、慢磁盘队列故障测试、菜单冷态与复用的原生观测见 `Testing/WindowsInputLatency.md`；未修改已持锁实证的 80 ms 语音和弦间隔、双击窗口、长按阈值或遥控器 BLE 参数。当前吞吐优化限于应用侧阻塞，不宣称无线链路提速。
+
+## 四向快捷菜单参考（2026-10-12）
+
+- 标签修订：按用户要求去掉菜单的“打开”前缀，复用本产品应用库/预设名称，采用常用简称 DSH、VS Code 等；未知品牌不盲改、启动目标不重写，不读第三方私有配置。圆环文字用已有 CSS 绝对定位与 translate 居中在扇区，UI Automation 原生边界与截图分别核验，见 `Testing/WindowsRingMenuLabels.md`。未复制外部实现，无新增运行时依赖。
+
+- 紧凑样式修订：方向圆环直接裁自项目已有 `public/RC003-remote-photo@2x.png`，使用 Pillow 做裁剪与抗锯齿透明蒙版，不合成新产品照片。Tauri 2.11.5 的 `Monitor::work_area`、窗口透明/无阴影接口按锁定源码核对，用工作区而非固定任务栏高度定位时钟上方。动画采用 CSS keyframes（translateY + opacity）及公开 Web Animations API 验证渲染帧，遵循 prefers-reduced-motion；未改语音、双击或长按时序，无新增运行时依赖。用户要求与证据见 `Testing/WindowsCompactRingMenu.md`。
+
+- 取消修订：按用户反馈新增鼠标点击菜单取消，替代此前鼠标穿透的限制。使用 DOM pointerdown / preventDefault 与现有 Tauri 2.11.5 WebviewWindowBuilder::on_navigation 接口；带代次的保留 .invalid 导航由宿主阻止，不加载外部页面、不发送网络请求，不引入新依赖。原生鼠标取消与不抢焦点分别验证，实体按键迟到仍待复测，见 `Bugs/2026-10-12-four-way-menu-cancel.md`。
+
+- 参考 AutoHotkey v2 Menu 的菜单项绑定独立动作与选择回调做法，复用本产品已有动作分发，不复制代码、不引入 AutoHotkey 运行依赖。官方文档仓库： https://raw.githubusercontent.com/AutoHotkey/AutoHotkeyDocs/v2/docs/lib/Menu.htm 。遥控器方向键直接执行并关闭是用户明确选择的交互，不照搬鼠标菜单的输入方式。
+- Windows 非激活窗口边界参考 Microsoft `WS_EX_NOACTIVATE` 文档： https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles 。采用项目已使用的 Tauri focusable(false) / focused(false) / 初始隐藏 / 页面加载后显示方案，保证执行快捷键时目标仍是原前台应用。10 秒是菜单交互超时，与语音或按键注入时序无关；中心长按沿用现有手势识别器的阈值。
+- 只接收已有遥控器按键来源；静态本地 HTML 通过 JSON + textContent 展示名称。方向配置写入本产品本地按键配置，不读取第三方应用私有数据；日志只记录代次、方向、状态与原因，不写功能名称或应用路径。
+
+## Twinkle Tray 单屏与目标切换扩展
+
+- 2026-10-12 用户最终要求亮度只保留调亮、调暗、切换三个动作。默认全部，切换后调节当前 ID；上一测试版 `monitor=null` 映射也跟随目标。下文“既有全部动作语义不变”仅描述此前五动作测试版，当前规则取代该界面与固定 All 语义，外部公开 CLI 边界保持一致。
+
+- 使用同一官方 CLI 的 `--List` 与 `--MonitorID`，不访问内部管道、数据库或私有配置。当前验证版本仍为 1.17.2.0；只接受明确的 ddcci / wmi 可控类型，文本按 UTF-8 解码、移除 ANSI 控制码并限制为 64KiB。ID 重复或子串匹配歧义拒绝，不依赖 `MonitorNum`。
+- 选择、切换和相对亮度请求共用同一有界 FIFO，执行时解析目标以保持“切换后调节”的顺序。目标 ID 只驻留内存，不写诊断日志；名称仅用于 UI。列表捕获使用有界读取、5 秒 CLI 预算和 Windows 公开 `CancelSynchronousIo` 取消阻塞读取；Microsoft 来源：https://learn.microsoft.com/en-us/windows/win32/fileio/canceling-pending-i-o-operations 。
+- 当前目标默认/重启回到全部，既有全部动作语义不变；目标缺失首次请求不执行亮度写入并回到全部，防止误调其他屏幕。Tauri 短暂提示使用本地静态 HTML、JSON 编码 + textContent，不加载第三方页面，不抢焦点，1.8 秒后销毁。参考 Tauri 2 公开 WebviewWindowBuilder 的 focusable / focused / initialization_script 与窗口生命周期接口。
+- 实际产品模块的独立探针验证单屏轮换不改变亮度、单屏 ID 调亮、回到全部、混合排队请求及初始亮度恢复。两块可控显示器的轮换/重排/失联用单元夹具验证，不冒充多屏真机验收。
+
+### FILE: TODO.md (conflict lines 3-36)
+<<<<<<< D:\Project\sayall\verification\port-local-features\merge\ours
+||||||| D:\Project\sayall\verification\port-local-features\merge\base
+## 2026-10-10 本地性能优化
+
+- [ ] 设置界面按需创建、关闭后释放 WebView，并配合页面懒加载/可见性轮询。实现和本机内存、四页显示、Ctrl+W/标题栏关闭、二次启动重建验证已完成；关闭后 WebView2 数量为 0，主程序组工作集约 65–71 MiB。实际托盘点击及双型号冷态语音、断连/睡眠回归仍待验，未发布或替换原安装版。证据与边界见 `Testing/WindowsWindowMemory.md`。
+
+=======
+## 通信与按键响应优化
+
+- [ ] 第二轮：普通快捷键回声诊断移出同步等待，用现有输入引擎的单次 deadline 检查代替 2 ms 轮询；待检查最多 64 条，退出取消，不新增常驻线程。新增 4 项测试与 Windows workspace 506 项测试通过；无回声受控对照中旧同步等待 62.106 ms（27 次读取），新提交 0.039 ms（单次样本，非实体端到端结果），fmt / workspace check / runtime-simulation check 通过。后随菜单残留修复包完成构建和原目录安装；整机后台占用与 RC001 / RC003 闲置首按、快速连按实测仍 deferred。打开应用异步化暂缓：需要先保证应用激活与后续快捷键的顺序，避免把输入送到旧窗口。见 `Testing/WindowsInputLatency.md`。不提交、不发布。
+
+- [ ] 应用侧实时链路移除同步日志写盘；四向菜单预加载并复用隐藏 WebView，保留同代次 ready / 取消守卫。Windows 自动化与原生窗口测试通过，本地未签名测试包已按用户要求覆盖安装，载荷、配置保留与启动验证通过；RC001 / RC003 冷态首按、快速连按、断连与睡眠恢复验收待完成。见 `Testing/WindowsInputLatency.md`。不修改蓝牙协议参数、语音和弦间隔或手势阈值；本轮不提交、不发布。
+
+## 四向快捷菜单
+
+- [ ] 启动菜单图标与关闭后原生窗口残留：取消启动预建，首次请求才创建；Win32 原生可见性/工具窗口样式读回，关闭清除旧页面显示类，失败请求销毁，孤儿关闭与迟到加载保护。原生 TDD、生产模式鼠标/焦点/WM_CLOSE、507 项 Rust 测试通过；本地修复包已在原目录正常覆盖安装，4 个配置文件保留，安装版启动的 Win32 枚举确认无菜单窗口。双型号实体复测仍 deferred，见 `Testing/WindowsMenuWindowLifecycle.md`。亮度连发仅评估替代方案，不改配置。不提交、不发布。
+
+- [ ] 圆环标签对齐与应用短名：四方向文字居中在圆环扇区，应用动作只显示友好短名（ChatGPT / DSH / 性能监视等），不改启动目标和应用库。502 项 Rust、311 项前端及原生文字坐标/取消验证通过，修订包已安装并保留配置；实体复测待完成，见 `Testing/WindowsRingMenuLabels.md`。不提交、不发布。
+
+- [ ] 紧凑遥控器圆环外观：直接裁出照片圆环，四方向低调文字、透明无大面板、右下角时间上方、480 ms 上移淡入。代码/原生渲染帧/位置/取消回归已验证，测试包已覆盖安装并保留配置；双型号实体和真实多屏复测待完成，见 `Testing/WindowsCompactRingMenu.md`。不提交、不发布。
+
+- [ ] 中心键长按四向快捷菜单：只在“确定 · 长按”提供菜单动作，上下左右四个方向分别自由配置；按方向立即执行一次并关闭。窗口不抢焦点，加载完成前不执行选择，鼠标点击菜单/中心/返回取消、10 秒超时、配置修改/断连/退出关闭。普通方向映射保留，菜单使用期间只执行菜单选项。2026-10-12 取消修复包已安装：鼠标取消原生验证、中心打开释放沿不补发单击、中心/返回取消状态机回归通过；失败时段新按下事件迟到原因与双型号实体取消复测仍待完成（`Bugs/2026-10-12-four-way-menu-cancel.md`）。自动化与本地 Windows 验证见 `Testing/WindowsFourWayMenu.md`，双型号实体按键验收待完成；按用户要求暂不提交、发布。
+
+## Twinkle Tray 显示器亮度
+
+- [ ] 普通按键映射“调亮所有显示器 / 调暗所有显示器”，步长 1–100 个百分点，默认 5；仅调整 Twinkle Tray 可控显示器，不修改默认按键绑定、不参与语音键生命周期、不支持按住连发。界面和后台串行调用已实现；本机 Twinkle Tray 1.17.2 的 `--All` 串行 9 次及产品后台连续 3 次均经 DDC/CI 硬件读回确认并恢复。单屏选择/切换目标不在首版范围；保留已有单屏配置兼容。RC001/RC003 实体按键、多屏不同初始亮度、商店版与睡眠恢复验收仍 deferred，见 `Testing/WindowsTwinkleBrightness.md`。
+
+- [ ] 单屏亮度与目标切换：最终只提供“调亮显示器 / 调暗显示器 / 切换亮度控制目标”三个动作。未切换时默认调节全部，切换后只调节当前目标。用公开 `--List` 识别 ddcci / wmi 显示器，按“全部 → 每块可控显示器 → 全部”循环，按 ID 而非编号绑定；重启回到全部，切换不改变亮度；上一测试版全部显示器映射自动跟随当前目标，旧编号映射保留。不抢焦点的 1.8 秒提示显示当前目标；失联目标首次请求不调整亮度、回到全部并提示。模块/前端测试和单屏原生 API 实验通过；多屏不同亮度与 RC001/RC003 新动作验收仍 deferred。用户已确认上一阶段全部显示器测试正常，但未区分具体遥控器型号，不扩大为双型号验收。见 `Testing/WindowsTwinkleBrightness.md`。
+
+## 2026-10-10 本地性能优化
+
+- [ ] 设置界面按需创建、关闭后释放 WebView，并配合页面懒加载/可见性轮询。实现和本机内存、四页显示、Ctrl+W/标题栏关闭、二次启动重建验证已完成；关闭后 WebView2 数量为 0，主程序组工作集约 65–71 MiB。实际托盘点击及双型号冷态语音、断连/睡眠回归仍待验，未发布或替换原安装版。证据与边界见 `Testing/WindowsWindowMemory.md`。
+
+>>>>>>> D:\Project\sayall\verification\port-local-features\merge\theirs
+
+### FILE: crates/sayall-windows/src/lib.rs (conflict lines 22-32)
+<<<<<<< D:\Project\sayall\verification\port-local-features\merge\ours
+||||||| D:\Project\sayall\verification\port-local-features\merge\base
+#[cfg(windows)]
+pub use bluetooth_radio::prepare_bluetooth_radio_recovery;
+=======
+pub mod quick_menu;
+pub mod twinkle_displays;
+pub mod twinkle_tray;
+#[cfg(windows)]
+pub use bluetooth_radio::prepare_bluetooth_radio_recovery;
+>>>>>>> D:\Project\sayall\verification\port-local-features\merge\theirs
+
+### FILE: src-tauri/src/lib.rs (conflict lines 3559-3574)
+<<<<<<< D:\Project\sayall\verification\port-local-features\merge\ours
+            // 手机一碰传（ADR 0004）：控制器必须在 platform 之后创建（自动粘贴要读语音
+            // 会话状态）；启动恢复在 `manage` 之后调用，失败只写快照 error，不阻断启动。
+            let phone_transfer = Arc::new(phone_transfer::PhoneTransferController::new(
+                settings.clone(),
+                Arc::clone(&platform),
+                saved_settings.phone_transfer.clone(),
+            ));
+||||||| D:\Project\sayall\verification\port-local-features\merge\base
+=======
+            // Use the initialized platform directly; AppState is managed later in setup.
+            let menu_ready = Arc::clone(&platform);
+            let menu_cancel = Arc::clone(&platform);
+            quick_menu_overlay::register(app.handle(), Arc::new(move |generation| menu_ready.quick_menu_ready(generation)), Arc::new(move |generation| menu_cancel.cancel_quick_menu(generation)));
+
+>>>>>>> D:\Project\sayall\verification\port-local-features\merge\theirs
+
+### FILE: src/pages/ButtonsPage.test.ts (conflict lines 1-10)
+<<<<<<< D:\Project\sayall\verification\port-local-features\merge\ours
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
+||||||| D:\Project\sayall\verification\port-local-features\merge\base
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
+=======
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { enableAutoUnmount, flushPromises, mount, type VueWrapper } from "@vue/test-utils";
+>>>>>>> D:\Project\sayall\verification\port-local-features\merge\theirs
+

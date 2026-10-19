@@ -1,0 +1,440 @@
+# 来源与归属
+
+## 菜单残留窗口修复与亮度替代方案评估（2026-10-12）
+
+- 菜单修复使用 Windows 公开 `ShowWindow`、`IsWindowVisible`、`GetWindowLongPtrW` / `SetWindowLongPtrW` 及 `WS_EX_TOOLWINDOW` / `WS_EX_APPWINDOW` / `WS_EX_NOACTIVATE`。微软文档：https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow 、https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible 、https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles 。`ShowWindow` 返回旧可见性，不能当作操作成功。按锁定 Tauri 2.11.5 / tao 0.35.3 源码核对缓存状态和样式更新行为，原生漂移由受控实验制造并独立读回；不宣称已找出现场首次漂移的具体调用，无新增依赖。
+- 启动不再预建菜单 renderer；第一次请求才创建，之后隐藏复用。关闭清除页面显示类并验证原生隐藏，失败请求销毁，旧回调不关闭新的有效代次。证据与硬件边界见 `Testing/WindowsMenuWindowLifecycle.md`。
+- 亮度替代方案只调研公开能力、不在本轮实现：Twinkle Tray 官方用户热键与 CLI（https://github.com/xanderfrangos/twinkle-tray#features）；微软 DDC/CI `SetMonitorBrightness`（https://learn.microsoft.com/en-us/windows/win32/api/highlevelmonitorconfigurationapi/nf-highlevelmonitorconfigurationapi-setmonitorbrightness）和 WMI `WmiSetBrightness`（https://learn.microsoft.com/en-us/windows/win32/wmicoreprov/wmisetbrightness-method-in-class-wmimonitorbrightnessmethods）。DDC/CI 不保证每台外接屏实现规范，WMI 不保证外接屏支持；热键重复触发/当前目标一致性尚未实测。禁止使用第三方私有 IPC 或编辑私有配置。
+
+## 通信与按键实时路径优化（2026-10-12）
+
+- 使用 Rust 标准库 `sync_channel` / `try_send` 有界非阻塞生产者与 FIFO 工作线程，不引入外部运行依赖、不复制第三方实现。按本机标准库契约核对；官方接口：https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html 。保留既有逐行重开日志文件的双进程轮转约束，队列满聚合计数，退出有界 flush；不承诺异常退出零丢日志。
+- 菜单复用依据锁定版本 Tauri 2.11.5 的 `WebviewWindow::navigate`、`on_page_load`、`hide` 与 `url` 源码接口；沿用本产品的非激活窗口边界。初次页面未加载时等待，不使用 `about:blank` 拼接菜单导航。无外部应用私有接口、无第三方进程注入；显示耗时与实体按键端到端耗时分开记录。
+- Windows 本地日志同步/提交对照、慢磁盘队列故障测试、菜单冷态与复用的原生观测见 `Testing/WindowsInputLatency.md`；未修改已持锁实证的 80 ms 语音和弦间隔、双击窗口、长按阈值或遥控器 BLE 参数。当前吞吐优化限于应用侧阻塞，不宣称无线链路提速。
+
+## 四向快捷菜单参考（2026-10-12）
+
+- 标签修订：按用户要求去掉菜单的“打开”前缀，复用本产品应用库/预设名称，采用常用简称 DSH、VS Code 等；未知品牌不盲改、启动目标不重写，不读第三方私有配置。圆环文字用已有 CSS 绝对定位与 translate 居中在扇区，UI Automation 原生边界与截图分别核验，见 `Testing/WindowsRingMenuLabels.md`。未复制外部实现，无新增运行时依赖。
+
+- 紧凑样式修订：方向圆环直接裁自项目已有 `public/RC003-remote-photo@2x.png`，使用 Pillow 做裁剪与抗锯齿透明蒙版，不合成新产品照片。Tauri 2.11.5 的 `Monitor::work_area`、窗口透明/无阴影接口按锁定源码核对，用工作区而非固定任务栏高度定位时钟上方。动画采用 CSS keyframes（translateY + opacity）及公开 Web Animations API 验证渲染帧，遵循 prefers-reduced-motion；未改语音、双击或长按时序，无新增运行时依赖。用户要求与证据见 `Testing/WindowsCompactRingMenu.md`。
+
+- 取消修订：按用户反馈新增鼠标点击菜单取消，替代此前鼠标穿透的限制。使用 DOM pointerdown / preventDefault 与现有 Tauri 2.11.5 WebviewWindowBuilder::on_navigation 接口；带代次的保留 .invalid 导航由宿主阻止，不加载外部页面、不发送网络请求，不引入新依赖。原生鼠标取消与不抢焦点分别验证，实体按键迟到仍待复测，见 `Bugs/2026-10-12-four-way-menu-cancel.md`。
+
+- 参考 AutoHotkey v2 Menu 的菜单项绑定独立动作与选择回调做法，复用本产品已有动作分发，不复制代码、不引入 AutoHotkey 运行依赖。官方文档仓库： https://raw.githubusercontent.com/AutoHotkey/AutoHotkeyDocs/v2/docs/lib/Menu.htm 。遥控器方向键直接执行并关闭是用户明确选择的交互，不照搬鼠标菜单的输入方式。
+- Windows 非激活窗口边界参考 Microsoft `WS_EX_NOACTIVATE` 文档： https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles 。采用项目已使用的 Tauri focusable(false) / focused(false) / 初始隐藏 / 页面加载后显示方案，保证执行快捷键时目标仍是原前台应用。10 秒是菜单交互超时，与语音或按键注入时序无关；中心长按沿用现有手势识别器的阈值。
+- 只接收已有遥控器按键来源；静态本地 HTML 通过 JSON + textContent 展示名称。方向配置写入本产品本地按键配置，不读取第三方应用私有数据；日志只记录代次、方向、状态与原因，不写功能名称或应用路径。
+
+## Twinkle Tray 单屏与目标切换扩展
+
+- 2026-10-12 用户最终要求亮度只保留调亮、调暗、切换三个动作。默认全部，切换后调节当前 ID；上一测试版 `monitor=null` 映射也跟随目标。下文“既有全部动作语义不变”仅描述此前五动作测试版，当前规则取代该界面与固定 All 语义，外部公开 CLI 边界保持一致。
+
+- 使用同一官方 CLI 的 `--List` 与 `--MonitorID`，不访问内部管道、数据库或私有配置。当前验证版本仍为 1.17.2.0；只接受明确的 ddcci / wmi 可控类型，文本按 UTF-8 解码、移除 ANSI 控制码并限制为 64KiB。ID 重复或子串匹配歧义拒绝，不依赖 `MonitorNum`。
+- 选择、切换和相对亮度请求共用同一有界 FIFO，执行时解析目标以保持“切换后调节”的顺序。目标 ID 只驻留内存，不写诊断日志；名称仅用于 UI。列表捕获使用有界读取、5 秒 CLI 预算和 Windows 公开 `CancelSynchronousIo` 取消阻塞读取；Microsoft 来源：https://learn.microsoft.com/en-us/windows/win32/fileio/canceling-pending-i-o-operations 。
+- 当前目标默认/重启回到全部，既有全部动作语义不变；目标缺失首次请求不执行亮度写入并回到全部，防止误调其他屏幕。Tauri 短暂提示使用本地静态 HTML、JSON 编码 + textContent，不加载第三方页面，不抢焦点，1.8 秒后销毁。参考 Tauri 2 公开 WebviewWindowBuilder 的 focusable / focused / initialization_script 与窗口生命周期接口。
+- 实际产品模块的独立探针验证单屏轮换不改变亮度、单屏 ID 调亮、回到全部、混合排队请求及初始亮度恢复。两块可控显示器的轮换/重排/失联用单元夹具验证，不冒充多屏真机验收。
+
+## Twinkle Tray 全部显示器亮度
+
+- 使用 Twinkle Tray 官方公开 CLI：`--All`、`--Offset`、`--Overlay`；亮度 CLI 从 v1.13.0 起支持，商店调用别名从 v1.17.1 起支持。来源：https://github.com/xanderfrangos/twinkle-tray#command-line-arguments 。只参考公开接口及行为，未复制源码，无新增运行时库依赖，需单独安装并启动 Twinkle Tray。
+- 本机验证版本 1.17.2.0；独立 Rust 探针使用 Windows 公开 `EnumDisplayMonitors`、Physical Monitor 枚举、`GetVCPFeatureAndVCPFeatureReply`（VCP 0x10）确认实际硬件亮度。官方来源：https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-getvcpfeatureandvcpfeaturereply 。不读取第三方私有配置，不直接调用未承诺稳定的内部管道，不注入第三方进程。
+- 100ms 并发 CLI 调用曾未完整累加；串行 `--All` 9 次、本产品后台请求 3 次均完整累加并恢复。故首版保留有界串行任务，禁用按住连发，成功提示只描述请求发送，不把退出码当硬件成功。具体数据与 deferred 边界见 `Testing/WindowsTwinkleBrightness.md`。首版只在 UI 提供全部显示器动作；已有单屏字段兼容保留，不静默扩大旧配置的控制范围。
+
+## 2026-10-10 设置窗口按需创建与前端轮询
+
+- 参考 Tauri 2 公开窗口构建/销毁与事件循环接口；关闭界面只销毁 WebView，显式退出才清理 Rust 平台层。源码接口按本地锁文件的 tauri 2.11.5 核对。官方文档：https://v2.tauri.app/reference/javascript/api/namespacewebviewwindow/ 。未复制第三方应用实现。
+- Vue `defineAsyncComponent` 配合动态 import 拆分按键、连接、权限、设置与向导页面，参考：https://vuejs.org/guide/components/async.html 。轮询使用公开 `document.hidden` / `visibilitychange`，有界单次任务不重叠，卸载后不重新启动。
+- 行为、内存口径与真实硬件边界见 `Testing/WindowsWindowMemory.md`。临时现场脚本与采样保留在仓库外，不引入产品或 CI 依赖。
+
+本仓库是面向 Windows 的 Rust/Tauri 工程。
+
+## 鼠标动作扩展
+
+- 鼠标单击/双击参考 AutoHotkey v2 Click 的成对按下/释放行为，不复制其代码或引入依赖；通过 Windows SendInput 单批发送 2/4 个边沿，部分提交时补发释放，不新设双击等待常量。参考： https://www.autohotkey.com/docs/v2/lib/Click.htm 。
+- 鼠标移动使用 Microsoft GetPhysicalCursorPos / SetPhysicalCursorPos；本机 150% 缩放实测发现 DPI-unaware 调用的 37 单位会变成约 56 物理像素，因此为该调用显式设置线程级 PER_MONITOR_AWARE_V2，并用 RAII 恢复原线程上下文。修正后右/左 37、下/上 53 物理像素均通过。参考： https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddpiawarenesscontext 。
+- 滚轮动作参考 AutoHotkey v2 的 WheelUp/WheelDown 动作粒度，仅参考行为，不复制实现或依赖 AutoHotkey。来源：`https://github.com/AutoHotkey/AutoHotkeyDocs/blob/v2/docs/lib/Send.htm`。
+- 滚轮使用 Microsoft 公开 SendInput / MOUSEINPUT API：INPUT_MOUSE + MOUSEEVENTF_WHEEL，mouseData 是带符号的滚轮位移；一个刻度为 WHEEL_DELTA（120）。来源：`https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput`。动作是用户可选配置，不绑定固定遥控器按键、不修改默认配置。测试和首按边界见 `Testing/WindowsMouseActions.md`。
+
+## Windows 注册应用扩展
+
+- 应用发现使用 Microsoft AppsFolder / IShellItem / BHID_EnumItems，启动使用 ShellExecuteExW + SEE_MASK_NOASYNC；只读取系统公开注册的可启动项，不扫描第三方私有文件或修改 Windows 注册。按本机缓存的 Microsoft windows-rs 0.62.2 API 签名核对实现；没有复制外部算法。参考： https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid 、https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow 。
+- 应用库仅保存在用户确认后的按键配置中；扫描不是启动，多选添加不是绑定。日志只记录数量、阶段和耗时，不记录应用身份或个人路径。验收方法见 `Testing/WindowsRegisteredApps.md`。
+- 前台切换依据 Microsoft `SetForegroundWindow` / `GetForegroundWindow` /
+  `LockSetForegroundWindow` / `AttachThreadInput` 公共 API 文档：Windows 即使满足常规
+  条件仍可拒绝后台进程抢前台，并改为闪烁任务栏；`AttachThreadInput` 只共享输入状态，
+  不承诺绕过 foreground lock；用户按 Alt 会解除该锁。本仓库因此以
+  `GetForegroundWindow` 的目标窗口读回作为成功判据，常规尝试读回失败后才用成对
+  Alt DOWN/UP 包住一次重试，物理 Alt 已按住时跳过，避免破坏用户键态。官方依据：
+  https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow 、
+  https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getforegroundwindow 、
+  https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-locksetforegroundwindow 、
+  https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-attachthreadinput 。
+- 2026-09-27 窗口候选筛选使用 Microsoft 公开 `GetClassNameW`、`GetWindowRect`
+  和 `DwmGetWindowAttribute(DWMWA_CLOAKED)`，在进程/AUMID 身份匹配后排除
+  辅助、未布局或被 DWM 遮蔽的窗口。`GetWindowRect` 的尺寸受 DPI 虚拟化影响，
+  因此只做宽松的小窗口门槛，不用精确尺寸识别特定应用；`DWMWA_CLOAKED` 用于
+  识别 Windows 隐藏于合成器的窗口。参考：
+  https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect 、
+  https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute 。
+- 2026-09-27 关窗后白屏复现补充：`GetWindowTextLengthW` 只用于判断 Chromium
+  顶层窗口是否已有标题，不读取或记录标题内容。无标题 `Chrome_WidgetWin_1`
+  的现场样本是 960×720 空白窗口，而正常主窗口标题长度非零；该筛选是已观测
+  框架窗口的兼容判据，不宣称 Windows 为所有应用提供统一“主窗口”标识。
+  官方 API 语义：
+  https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextlengthw 。
+
+## 遥控器电量显示
+
+- **GATT Battery Service 订阅（2026-09-27 起主路径）**：Bluetooth SIG 标准 Battery Service `0x180F` / Battery Level `0x2A19`（单字节百分比，`read|notify`），在既有 ATVV GATT 会话内通过公开 WinRT API `GetGattServicesForUuidWithCacheModeAsync` / `GetCharacteristicsForUuidWithCacheModeAsync` / `WriteClientCharacteristicConfigurationDescriptorAsync` / `ReadValueAsync` 订阅与读取，不新开 BLE 会话。规范来源：Bluetooth SIG GSS 规范（Battery Service 1.1 / Battery Level）。设备端支持 notify 的真机证据：`hardware/RC003/evidence/gatt-probe-listen1.log`（订阅后 0.5s 内推送 0x1E=30%）。
+- Microsoft 公开 Configuration Manager API `CM_Get_Device_ID_List_SizeW` / `CM_Get_Device_ID_ListW` / `CM_Locate_DevNodeW` / `CM_Get_DevNode_PropertyW`：兜底路径，只枚举当前存在的 BTHLE 设备，按连接所选对端的完整地址组件匹配唯一节点，读取 OS 设备属性。官方文档：`https://learn.microsoft.com/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_devnode_propertyw`。标准 `System.Devices.BatteryLife` / PKEY_Devices_BatteryLife 的 GUID/PID/type 由本机 Windows SDK 10.0.22621.0 `propkey.h` 核对。
+- `Gronsten/razer-tray`，提交 `8e7e395417023bf2446779a4c5237716183da69f`，`src/DeviceMonitor.cpp`：参考其使用公开 Configuration Manager API 读取 Windows Bluetooth 电量缓存属性 `{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2` 的路径和未知值语义；未复制代码、无运行时依赖。该键不是微软承诺跨版本稳定的标准 BatteryLife 属性，故仅作可失败的兼容读取，严格检查 BYTE、长度为 1、0..100；缺失/异常保持未知。
+- GATT notify 订阅成功时不轮询缓存；订阅失败或设备无 BAS 时由独立后台线程每 60 秒查询一次系统缓存兜底（缓存值不代表遥控器实时上报）。不访问注册表，不读取第三方 App 数据，不使用设备管理写入 API。连接纪元隔离迟到结果，断连/睡眠后停止订阅与监视并隐藏旧值；可选电量功能不影响语音错误状态（订阅为 best-effort，失败仅回退、不阻塞连接）。详见 `Testing/WindowsBattery.md`。
+
+## 治理规范迁移
+
+- `HD838A/remote-mic-app`，提交 `b233a88cc4457b00413dda6b37ec8b4af12c5121`：迁移其平台无关的分支/提交纪律、日志脱敏与完整链路记录、Bug 复现取证顺序、测试手册要求、发布来源可追溯和资产不可变原则；本仓库将其改写为 Windows/RC001/RC003、Tauri/NSIS、updater minisign 与 Authenticode 边界。
+- 有意排除：Swift/SwiftPM、CoreBluetooth、AppKit/SwiftUI、Developer ID/Apple 公证、Sparkle、DMG/PKG、Apple Team ID、macOS/iOS/Web 专属流程，以及任何 macOS 私有路径或凭据。
+- 迁移文档：`LOGGING.md`、`RELEASING.md`、`TECHNICAL.md`、`TROUBLESHOOTING.md`、`Bugs/README.md` 与 `Testing/WindowsRelease*.md`。这些文件记录的是规范与经验，不复制参考仓库业务代码。
+
+## App Logo 版权
+
+- App Logo 与 App Icon 沿用 `HD838A/remote-mic-app` 的版权边界：属于 HD838A 保留版权的专有品牌资产，不纳入 GPL-3.0-only；Windows 版适用范围和授权条件见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。
+
+## 产品与 UI 基准
+
+- `HD838A/remote-mic-app`：无线麦 macOS 原版的信息架构、产品文案、RC003 图片、RC001/RC003 型号识别、ATVV 行为和测试边界；RC001 支持参考提交 `b233a88cc4457b00413dda6b37ec8b4af12c5121`。
+  - 2026-09-05 按键映射功能移植补充（均为语义移植，非代码复制）：`RemoteButtonGestureRecognizer` + `HIDRemoteScheduler` 的手势参数（双击窗口 300ms、长按 550ms、连发起始 350ms、返回 50ms/方向与音量 100ms 连发）与"按配置动态启用双击/长按识别、未配置时单击零延迟"的语义；`KeyboardEventSuppressor` 的预测式武装 + 有限窗口匹配吞键模型；`RemoteMappingCanvas` 的按键卡片布局表（锚点/目标 Y 坐标逐键移植）与三态高亮（按下=橙、选中=强调、普通=中性）；`MappingSelectionPolicy` 的"锁定当前按键"默认值。Mac 版 `KeyboardEventSuppressor` 的 UP 沿无配对兜底（DOWN 泄漏+UP 吞下=粘键缺陷）未移植——Windows 版沿用本仓库 2026-09-05 规则（DOWN 漏进 OS 则 UP 必放行）。
+  - 2026-10-05 按键「按住时连续执行」（Windows 扩展语义；参数与互斥理由参考 Mac `HIDRemoteScheduler.repeatIntervalMilliseconds`（返回 50ms、方向/音量 100ms）与 `HIDRemoteMonitor.startRepeatIfNeeded` 的「无次级手势才启动连发」互斥依据，未复制代码）：**与 Mac 的差异（Windows 自有语义）**——连发改为按键级显式开关（界面 2026-10-05 定稿为 radio 三选一：关闭 / 重复单击动作 / 重复长按动作；连发目标为单击或长按槽位，用户指定，双击不参与；见 `docs/plan/2026-10-05-button-hold-repeat-radio.md`）；长按动作触发后可继续按间隔续拍；双击共存时按住超过双击窗（0.3s）即确认为单击并起拍；可连续性按动作白名单判定（单键、滚动、鼠标移动；组合快捷键、打开应用、聚焦输入框、鼠标点击只执行一次）。旧配置按旧版自动连发行为迁移为显式开关；旧版对组合键（如 Ctrl+C）的连发在新模型中不再生效（有意修正）。
+  - 2026-09-09 按键映射配置导入导出补充（本地 Mac 仓库 HEAD `feba1d6`，语义参考，未复制代码）：参考 `AppSettings.exportedConfigurationData/importConfiguration` 的版本化 JSON、导入前完整解码校验与一次性应用，以及 `SettingsView.exportConfiguration/importConfiguration` 的系统文件选择器、用户取消静默、成功/失败反馈。Windows 版仅迁移按键映射，不导入 Mac 专属设置或统计；格式使用独立 `formatVersion: 1` + `buttonMappings` 契约，不宣称与 Mac 配置文件互通。
+  - 2026-10-02 设置页改版与应用图标切换（Mac main `e8af2da2`，语义参考，未复制代码；同日按用户指正修正：Mac 菜单栏状态图标在 Windows 不存在，已整体撤掉）：
+    ① **设置页信息架构**参考 `Sources/RemoteMic/SettingsView.swift` 的 `aboutPage`——顶部一行为应用图标 + 名称 + 标语，其右为"当前版本 + 检查更新 + 检查预发布版本开关 + 一条分隔线 + 更新状态"，其后是带分组标题的"通用""问题反馈"卡片，卡内每行 = 行内图标 + 标题 + 右侧控件（`settings.section.settings` 的标题是"设置"、图标是 `gearshape`，因此 Windows 侧栏末位页从"关于"改名"设置"并换齿轮图标）。Windows 没有的模块（Dock/菜单栏图标、应用语言、重新运行设置向导、服务环境、会员、分享）不移植；"诊断与日志"保持在权限页（2026-10-01 用户指定），不在设置页重复。
+    ② **应用图标切换**参考 `Sources/RemoteMic/AppIconController.swift` 的 `AppIconIdentifier` / `AppIconCatalog` / `AppIconController`：稳定语义 ID（`standard` 与 `faceted-duck`，原样沿用 Mac 的 rawValue）、未知 ID 回落 `standard`（`resolvedIdentifier(for:)` 同款）、切换即写结构化日志（Mac `APP_ICON CHANGE` → Windows `app_icon action=apply ...`）、选项文案取自 Mac 的 `about.preferences.app_icon_*`（应用图标 / 默认 / 几何鸭）。
+      - Mac 换的是 `NSApplication.applicationIconImage`（Dock / 应用切换器 / 设置窗口）。Windows 上"各个地方"= **主窗口图标（任务栏 + Alt-Tab + 标题栏）、通知区域托盘图标**（`src-tauri/src/app_icon.rs`）与**开始菜单 / 桌面 / 固定到任务栏的快捷方式图标**（`src-tauri/src/shortcut_icons.rs` 改写 `IconLocation`，2026-10-03），设置页顶部标识由前端按同一 ID 实时渲染；exe 与安装包自身的图标属于安装产物、运行期不可改（与 Mac bundle 图标不变一致），但 2026-10-04 起构建时即取几何鸭（见下条 ③）。
+    ③ **图标资产**：`src-tauri/icons/app-icons/faceted-duck-{16,20,24,32,256}.png` 与 `public/app-icon-faceted-duck.png` 由 `scripts/generate-app-icons.py` 从仓库内源图 `src-tauri/icons/app-icons/faceted-duck-source.png` 派生（Windows 满画布导出：图案实心占比 ≥ 95%，脚本以 `FILL_RATIO_MINIMUM` 卡住；2026-10-03 前用的是 Mac `Resources/AppIcons/faceted-duck.png` 的导出，那份沿 macOS 图标网格留白，在 Windows 任务栏/托盘会比邻居"小一圈"）——只做尺寸缩放，不改设计；不联网、不修改 Mac 仓库。`standard` 的水彩鸭资产（与 Mac `Resources/AppIcon.icns` 同源）由 `scripts/generate-standard-icon.py` 从源图 `icon-source.png` 做 Windows 满画布处理（探测瓷贴边界 → 裁掉外部阴影 → 拉伸铺满 → 派生 PNG 与 `icon.ico`，同样按 `FILL_RATIO_MINIMUM` 卡住；2026-10-03 前那份导出沿用 macOS 网格留白，实心只占 81–83%），装饰全在瓷贴内，处理不裁切设计；2026-10-04 起它只服务运行期切换（窗口/托盘取 `icons/128x128@2x.png`、快捷方式取 `icons/icon.ico`），不再随安装包分发。
+      - 2026-10-04 用户定稿（Windows 侧口径，Mac 默认仍是 `standard`）：新装默认选中 `faceted-duck`（`AppIconIdentifier` 的类型默认与"配置缺字段"的落点都是它；认不出的 ID 仍回落 `standard`），`bundle.icon` 与 `installerIcon` / `uninstallerIcon` 一并改指 `icons/app-icons/faceted-duck.ico`——exe、安装包与卸载器的图标都是几何鸭；相应地 `standard`（水彩鸭）的窗口/托盘不再取 `default_window_icon`（已等于几何鸭），改内嵌 `icons/128x128@2x.png`。
+      - 同日二次定稿（真机现场）：旧版本会把默认图标（`standard`）在任意一次保存时写进配置，用户并没有做过选择——因此 `schema_version` 升到 4，**4 之前的配置升级时一律改用几何鸭**，4 起（本版本写下的选择）才按用户的值保留（`AppSettings::normalized` 的迁移；`SettingsPage` IPC 读回即生效）。这与 Mac 的偏好语义有意不同：Mac 的 `AppIconIdentifier` 一直按存储值解析。
+      - 同期实测发现并修复：2026-10-03 换满画布源图时漏掉了 `faceted-duck.ico`——仓库里那份仍是旧 macOS 留白导出（256px 档可见填充 0.938），且条目表还是从小到大（首条目 16px，`tauri-codegen` 会把它当窗口默认图标）。`scripts/generate-app-icons.py` 现按 .ico 一并生成（16/20/24/32/48/256、最大档在前）并逐档卡 `FILL_RATIO_MINIMUM`，Rust 侧用 `faceted_duck_ico_256_frame_fills_the_canvas` 与 `faceted_duck_ico_puts_the_largest_entry_first` 钉住。
+  - 2026-10-04 语音增益（Mac main `c1840de9`，语义参考，未复制代码）：
+    ① **DSP** 对应 `Sources/RemoteMic/ATVVProtocol.swift` 的 `PCMPostprocessor.process(_:gainDB:)`（1‑2‑1 平滑 + `10^(dB/20)` 缩放 + Int16 削波，内部限幅 −24–24 dB，非有限值按 0 dB）——Windows 侧同款算式早在 `crates/sayall-core/src/pcm.rs::process_pcm` 中就位，本次只新增 `normalize_gain_db` 统一**用户可设范围**（0–24 dB，对齐 Mac `AppSettings` 的 `0...24` 校验）的钳制口径，算式本身未改。
+    ② **交互** 对应 `Sources/RemoteMic/SettingsView.swift` 的 `audioSettingsPanel`：标签「增益」+ 滑块（0–24 dB、步进 1）+ `Int(gainDB) dB` 读数 + `audio.gain.help` 文案（“0 dB 保持原始音量；数值越大声音越响，也会放大环境噪声。建议先从 6–12 dB 开始。”按中文语义原样取用）。Windows 把该控件放在连接页「语音设备」卡（Windows 的音频设备选择在该页，Mac 在设置页音频面板）；生效时机对齐 Mac 的“每帧读取当前值”——BLE 工作线程每批音频前刷新，改动从下一批音频生效、无需重开会话；启动时从 `AppSettings.gain_db` 恢复。
+    ③ 未移植：Mac 的配置文件导出/导入（Windows 的导出仅按键映射，独立格式）。验收见 `Testing/WindowsRC003Preview.md` 用例十五。
+- RC003 图片 SHA-256：`658d9333853958c13ff721eb76e1a6816c1dbea16006a84e8577ad410812549f`。
+
+## Windows 行为与测试参考
+
+- **登录时自动启动（2026-09-14）**：产品行为参考 macOS 仓库
+  `LoginItemService.swift` 的“读取系统状态 → 注册/取消 → 失败反馈”模式；Windows
+  不移植 `SMAppService`，改用微软公开的当前用户登录启动项
+  `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`，只写本应用值且不需管理员权限。
+  设置默认关闭，应用启动时以持久化偏好同步系统状态，失败只记录结构化日志、不阻断启动。
+
+- **LL 吞键对 Raw Input 交付影响的本机实证（2026-09-05，`docs/investigations/2026-09-05-ll-swallow-vs-raw-input.md`）**：双线程探针（钩子线程 + Raw Input INPUTSINK 线程分离，key_suppressor 同构）两轮一致证实 **WH_KEYBOARD_LL 返回 1 吞掉的键盘事件不会再投递 WM_INPUT**——按键映射门控（`key_gate.rs`）据此采用"被吞键盘边沿由钩子线程直接喂引擎 + 监听器喂 HID 报文与透传键盘事件"双源合并架构；HID 报文归因武装 + 60ms 有界等待沿用 key_suppressor 实证参数。
+
+- `HD838A/remote-mic-app#249`，提交 `090a3cfc24f0e3e733b2347ee2daf87c60e10097`：Windows 独立实现、ATVV 测试夹具、语音边沿、安装升级、公开边界和 Mac 风格 UI 原型；Raw Input 参考了 `hid_identity.py` 与 `raw_input_windows.py`，SendInput 的批量提交、物理修饰键和失败回滚参考了 `win32_input.py` 与 `win32_keys.py`，均以 Rust/windows-rs 重新实现。
+- `GetSayAll/hardware-simulation`，提交 `65248499cac7da3ad46cd0c11dca1478f7733255`：RC001 短语音时间线的控制通知、40 + 80 字节音频拆包和停止通知；本仓库只保留纯 ATVV 回放所需字段。
+- `GetSayAll/hardware-simulation`，提交 `9823b70`（PR #3，分支 `feat/windows-rust-simulation`）：Windows（Rust）模拟实现与 `hardware-sim export-app-script` 的**应用信号脚本契约**（`schemaVersion` / `atMilliseconds` / `kind`；`hid_report` 带 `reportID`+`dataHex`；`voice_control`/`voice_audio` 带 `dataHex`；未识别事件保留 `raw` 的 `transport`+`originalKind`+`payload`）。本仓库消费侧解析器见 `crates/sayall-windows/src/hardware_script.rs`，并以该仓库的真实导出产物做契约测试——两侧改动需同步。
+- `ZSTDJan/windows-remote-mic-app`：WinRT BLE、Raw Input、音频输出、发布门禁和真实硬件验证边界；其语音页按语音程序配置"按住说话快捷键"、按下注入 DOWN/松开释放的行为，是本仓库按住说话快捷键设置的产品参考。Round 1 拆解曾记两项技巧参考，后续实证修正（Round 2/3）：**physicalize 技巧——结构性无效（勿模仿）**：`legacy_key_suppressor_windows.py` L142-155 的做法（仅对自家 keybd_event 注入的带 "RMICRC03" 标记右 Alt，在自家钩子的私有副本上清 INJECTED 标志→转发→恢复）曾被解读为"使下游应用钩子视为物理键，前提是自家钩子位于目标应用钩子之前（链头）"——该解读不成立（Round 2 E 三层实证：LL 钩子每钩子收到私有结构副本，修改不跨钩子传播，CallNextHookEx 转发通道不存在，应用层收到原始键；Round 3 J 语义复查：清标志对下游钩子/应用层均不可见，且 ZSTDJan 进程内也无读者——对声明目标是 no-op；其真正能影响豆包读值的是 `doubao_rpc.py` 的 Frida 版 attach 方案，未接线进生产流程，违反本仓库 A2/A4/A5 边界，仅作机理记录）。**WeType 语音触发配方——本机实证有效（Round 3 J 翻案）**：SendInput 注入 Ctrl+Win 按住（纯 wVk 或扫描码配方均可）可唤起 WeType 语音（会话级 TSF 激活前提下：开麦/吞键/释放关麦全链实证，注入 ground truth 由常驻捕获器独立记录）；**Round 2 F 曾判"三配方无反应"，系其 TSF 激活用了线程级 flags（dwFlags=0，会话级应为 TF_IPPMF_FORSESSION=0x20000000）、WeType 从未真正激活所致——教训：测试 IME 行为前必须以会话级激活 + 行为判据（候选框版式）双重确认活动输入法**。**配方形态约束（2026-09-04 P 实证，evidence/p）：和弦必须逐事件注入且两键间隔 ≥80ms——WeType 拒绝单次 SendInput 批量零间隔提交的 Ctrl+Win（sent=2/2 全到达仍无吞键无开麦；逐事件 80ms 两轮 2/2 触发，A 失败→B 通过→A 失败→B 通过交替序列排除状态漂移）**；应用曾把该配方误合并为单批零间隔导致真机不出字（Bugs\2026-09-04-wetype-zero-gap-injection.md，含第二层缺陷：遥控器 F5 须由抑制器吞掉，否则"额外按键"拒绝；钩子链头 bump 加固同日落地），已修复并 RC001 真机端到端 passed（2026-09-04，用户确认文字上屏）。
+- `richlearntodo-debug/vibe-flow`，提交 `047f9d3ead54bf30de9b884adf8f7b5adefe9993`：自然 ATVV 会话、WASAPI 音频生命周期和硬件验收清单。
+  - **Windows 深色模式专项调研补充（2026-09-08，本地参考库 HEAD `b47f7cdce8b753fade0c64c97332bebe80f17d2d`；主应用 UI 源码未开源，依据为 `docs/ARCHITECTURE.md`、`docs/PRODUCT_AUDIT_2026-09-01_ZH.md` 与用户指南）**：其产品支持浅色、深色、跟随 Windows 三档且运行中切换不重启 Host/Bridge/Capture；审计结论要求深色采用低饱和中性色层级，并完成各页实际截图检查。本仓库只借鉴“三档主题、主题是纯显示行为、不得重启后台服务”和视觉验收边界，不复制实现；SayAll 将选择器放在“关于”页面，并通过自身 `SettingsStore` 持久化，详见 `docs/plan/2026-09-08-windows-dark-mode.md`。
+  - **按键映射/双响应专项调研补充（2026-09-07，本地参考库 `Documents\Codex\reference-repos\vibe-flow`，HEAD `b47f7cdce8b753fade0c64c97332bebe80f17d2d`；主应用源码未开源，依据为其文档 + `scripts/VoxDeckInputBridge.cs` + `driver/rc003-filter`）**：
+    1. **用户态"拦截↔设备身份互斥"独立复证**：其 V1.3 根因报告（`docs/V1_3_INPUT_ROUTING_ROOT_CAUSE_ZH.md`）实测——LL 钩子拦截 → Windows 不投递对应 WM_INPUT → Raw Input 拿不到 RC003 设备身份 → 动作永不执行（旧候选日志：钩子暂存 166 边沿/真正到达 Raw Input 4/配对 0/实体路由 0）。与本仓库 2026-09-05 `ll-swallow-vs-raw-input` 实证同结论，两库独立互证；本仓库以 GATT 前信号（0x04 早于 HID 60-90ms）做武装归因，不受此陷阱影响，为同类实现中结构更优。
+    2. **其用户态发布版（V1.5）的答案=接受共存**：钩子对非语音映射键一律放行（不拦截、也不暂存回放），Raw Input（INPUTSINK + 设备句柄指纹）负责设备归因与动作执行，明确接受"遥控器原始键系统效果与配置动作同时发生"，文档要求"不应在 UI 或发布说明中描述为精确拦截"；默认 Profile 全部映射=该键原生效果（上→上、确认→Enter）使共存不可见，非默认 Profile（如左→browserback、上→Ctrl+Z）实际存在与本仓库同款的"原生+注入"双响应。语音键（RC003 固件形态=F5）是唯一在钩子层无条件按 VK 抑制的键（物理键盘 F5 冲突被接受，或交由驱动路径解决）。
+    3. **唯一彻底解=KMDF per-device upper filter（候选未发布）**：INF 精确绑定 VID 0x2717/PID 0x32B8（不做键盘类过滤器，普通键盘零影响），按扫描码位图抑制 + 全边沿环形队列入队上抛用户态；250ms 心跳、2s 超时 fail-open 全放行、策略 generation 变更清队列防陈旧事件、控制句柄关闭即解除抑制。与本项目 ADR 0002/Helper 轨定位同构；其 `driver/rc003-filter/README.md` 的 10 项发布门禁（SDV/HLK/微软签名/Secure Boot+内存完整性/卸载回滚/万包压测）可作 Helper 轨验收清单参考。
+    4. **已退役路线警示**：独占 GATT 抢占 HID 服务/强制禁用 HID 子设备 → Windows 将键盘子设备判为 critical，`/force` 禁用成 reboot-pending 状态而非安全热交接——本仓库 GATT 归因为并行订阅（不禁用系统 HID 栈），勿走独占抢占路线。
+    5. **互证数据点**：RC003 返回/音量±/电源键在钩子/键盘 Raw Input/Consumer Raw Input 全通道不可见（HID GATT 0x1812 特征 AccessDenied；厂商服务 8a7a0001-… 的 Notify 无按键事件；Frida 旁路 WUDFHost 监听 IOCTL 无捕获）→ 其结论"硬件能力缺失给诊断、不宣称映射成功"，与本仓库 RC003 返回/音量±格子禁用同构；WeType 配方 Ctrl+Win/toggle/80ms、语音键=F5、"重连后扫描码偶变→持久语音映射保持权威"均与本仓库实测一致或互补。
+    6. **工程细节参考**：RawKeyboardEdgeTracker（keysDown 集合按扫描码身份 add/remove，防钩子/Raw Input/驱动多源双触发）；长按 650ms、连发起始 420ms/间隔 80ms；TV=Win+Tab 任务视图且"方向键仅任务视图激活期间执行映射动作"（拥抱原生效果而非对抗）；动作执行回执（真实 SendInput 结果而非排队即成功）。
+- `mwlt/Voice_VibeCoding`，提交 `c89410aed3b274fee5e571128b82c9c6e6689715`：Rust/Tauri 模块划分、windows-rs API、音频生命周期和托盘窗口工程经验；其语音键按住注入的 Hold 语义（按下先快捷键 DOWN、松手统一释放、SendInput 互斥降级）是本仓库按住说话快捷键注入时序的参考。Round 1 拆解补充其 **LL 钩子吞键工程细节**（本仓库吞键层设计的参考，非逐行复用）：时序窗吞键（音量 recent 200ms、back/home/menu/tv/power 250ms、方向/OK 200ms 或 tap_ready+自定义位图）、钩子链头 bump（重叠安装：先挂新钩再卸旧钩，消除 LL 吞键空窗）、F5 语音键状态机（sticky/correlate 120ms/tail 3s；DOWN 漏进 OS 则 UP 必放行，防粘键）、音量防双格（Tap 转发 + SendInput VK_VOLUME_* + 200ms 吞固件残留）、Alt 和弦用 SendMessageTimeoutW 直发前台避免系统菜单、自家注入放行（EXTRA_INFO 标记或 INJECTED→CallNextHookEx），及 bump 空窗/sticky 粘键/60ms 去抖门等已踩坑清单。本仓库只使用 SendInput 公共 API，不引入其 WinUHid 虚拟键盘驱动。
+- `cgutman/WinUHid`（MIT 许可）：用户态 UMDF 虚拟 HID 键盘/鼠标驱动框架（C++/Win32），无预编译 Release，需自建并签名后使用；ADR 0002 增强轨驱动来源的第一候选（须先审计）。签名成本调研结论（**已闭合，2026-09-04**：UMDF 分发不需硬件计划/EV，OV 级 catalog 签名为最低门槛——三层官方原文支撑，`docs\investigations\evidence\g\signing-policy.md`；残余含混=无单句官方原文直书此结论，装机实测 deferred（调查护栏限制））记录于 `docs\investigations\2026-09-04-avoid-driver-signing-input-paths.md`。未经审计的 WinUHid 二进制不进入仓库。
+- `QL-4/RemoteMapper`，main 提交 `25ca0c13cf2ff2caf7caae3d9690f9629b7c0df0`（另有 `driverless-keymap` 分支）：小米蓝牙遥控器 → 微信输入法（WeType）语音录入的完整端到端先例——按住语音键唤起 WeType 录入并送入音频，松开结束录入并恢复系统原默认麦克风。可借鉴结论：(1) **双分支分层**：`main` 含 KMDF HID lower filter（需 TESTSIGNING），`driverless-keymap` 无驱动直接交付、但缺返回/音量±三个键（被 kbdhid.sys 丢弃）且 LL 钩子映射会误吞物理键盘同名键——印证本仓库"基础路径免驱动 + 增强轨驱动"分层与"LL 钩子无来源设备 ID"的既有判断；(2) **MiRemoteHidFilter 驱动做法**：extension INF 精确绑定 VID 0x2717 / PID 0x32B8（不匹配其他键盘），修复 kbdhid.sys 丢弃的 usage 0x80/0x81/0xF1，并把普通键改写为 F13–F19、语音键 HID F5 改写为 F20，从源头规避误吞物理键盘同名键；实现为转发 `IRP_MJ_READ`、下层完成后原地等长改写 Report ID 0x01 的 `report[3]`（实测报告格式 `01 00 00 <usage> 00 ...`，report[1]=modifiers、report[2]=reserved），不改 Report Descriptor / Report ID / 报告长度；HVCI 开启下 Windows 11 x64 八键验收通过（KMDF 1.15 + WDK 10.0.26100，过 PREfast/InfVerif/ApiValidator/Inf2Cat）；其"KMDF 正式发布需 Hardware Dev Center attestation/WHCP、UMDF 2 迁移未实现"的结论与本仓库 ADR 0002 签名成本结论互证；(3) **VB-Cable 音频路径**：遥控器音频经 CABLE Input/Output 转发、临时切换系统默认录音设备喂给 WeType——依赖第三方虚拟声卡驱动和默认设备切换，违反本仓库基础路径边界，仅作增强轨/目标 App 适配参考。排除项：其语音键支持单击/双击/长按配置，违反本仓库"语音键只支持按下开始、释放结束"规则，语音键不借鉴；`keymap.json` + 托盘双击映射面板（单击/双击/长按可配、保存即生效、旧 `keymap.txt` 自动迁移）可作普通键映射产品化参考。
+- `wasapi-rs` 0.24.0：MIT 许可的 Windows Core Audio 安全封装，用于端点枚举、共享模式渲染与 padding 查询。
+- **CABLE Input 端点静音自愈（2026-09-07）**：依据 Microsoft Core Audio `IAudioEndpointVolume` / Endpoint Volume Controls 公共 API（`learn.microsoft.com/windows/win32/api/endpointvolume/nn-endpointvolume-iaudioendpointvolume`、`learn.microsoft.com/windows/win32/coreaudio/endpoint-volume-controls`），共享模式端点的主静音属于端点级状态，不是应用 WASAPI 写入成功即可证明可听。本仓库仅对名称确认的 VB-CABLE 渲染端点在打开时及每次语音会话开始前调用 `GetMute` → 必要时 `SetMute(FALSE)` → `GetMute` 读回确认；不修改物理输出设备，也不覆盖用户音量标量。调用结果、检查点和耗时写入结构化 GATT 诊断日志。
+- **SayAll 会话静音自愈（2026-09-07）**：用户现场观察到音量合成器左侧 CABLE Input 端点未静音，但右侧“无线麦 SayAll”应用会话在开始推流后很快重新静音。依据 Microsoft `IAudioClient::Initialize` 文档，渲染会话默认会跨应用重启持久化音量与静音状态；依据 `ISimpleAudioVolume::GetMute/SetMute`，应用会话静音独立于端点主静音。实现使用 `IAudioSessionManager2::GetSessionEnumerator` + `IAudioSessionControl2::GetProcessId`，只锁定当前 SayAll 进程在用户已选 CABLE 端点上的会话；初始化、语音会话开始、`IAudioClient::Start` 后读回，并在推流期间每 100ms 低频检查，发现静音才解除，不修改会话音量、不碰系统声音或其他进程。初始化时另以 `IAudioSessionControl2::SetDuckingPreference(TRUE)` 让 SayAll 会话退出 Windows 默认通信自动压低机制；该预防措施不作为外部静音来源已经归因的证据。官方依据：`learn.microsoft.com/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize`、`learn.microsoft.com/windows/win32/api/audioclient/nf-audioclient-isimpleaudiovolume-setmute`、`learn.microsoft.com/windows/win32/api/audiopolicy/nf-audiopolicy-iaudiosessionmanager2-getsessionenumerator`、`learn.microsoft.com/windows/win32/api/audiopolicy/nf-audiopolicy-iaudiosessioncontrol2-getprocessid`、`learn.microsoft.com/windows/win32/api/audiopolicy/nf-audiopolicy-iaudiosessioncontrol2-setduckingpreference`。
+
+## 延迟调研来源（2026-09-05，语音键按下→电平图出现优化专项）
+
+按仓库规则（实现前先调研），本专项调研结论与边界记录如下；对应实测见 `docs/investigations/evidence/p/FINDINGS.md`（端点预热对照实验）：
+
+- **业界 PTT"按下→开麦"模式**：可查证的主流实现均为"音频链路常驻 + 按键只做门控"（Mumble 持续采集+传输模式门控 `mumble.info/documentation/user/audio-settings/`；Zoom 会议内按住空格解除静音 `support.zoom.com` KB0063250；Discord PTT Release Delay 滑杆，页面被反爬，引自搜索摘要）。本仓库渲染端点常驻打开（`audio.rs` SelectEndpoint 打开后跨会话复用）与此一致。
+- **WASAPI 冷启动与端点电源**：微软 PortCls 文档——音频设备空闲（示例 1s）进入 D3，恢复 D0 规格要求 ≤35ms/≤300ms（`learn.microsoft.com/windows-hardware/design/device-experiences/audio-subsystem-power-management-for-modern-standby-platforms`）；JUCE 论坛实测 WASAPI 设备冷创建 2-3s、Initialize 数百 ms（`forum.juce.com/t/wasapi-2-3s-delays-on-creating-audio-devices/54971`）；StackOverflow `IAudioClient::Start` 通常 5-6ms（被 Cloudflare 拦截，引自摘要）。**"跨进程保温端点让第三方 Initialize 更快"无公开量化先例**——本仓库已用持锁对照实验自行量化：对 WeType 开麦延迟无效（冷/热中位数差 0.3ms，evidence/p，2026-09-05），该方向就此关闭。
+- **WeType/微信输入法语音快捷键形态**：默认按住 Ctrl+Win（微信电脑版 4.1.7+ 同款，可于微信"设置→快捷键"自定义；新浪财经/光明网/callmysoft 报道）；社区帖（linux.do/t/topic/2409202，2026-06-15，早于 2.1.3，引自搜索摘要）称 WeType 语音快捷键"必须以 Ctrl/Alt/Shift 开头，不能设独立单键"——**待 2.1.3 真机复核**；ghxi 评论区提到"单击 Ctrl 触发"模式（懒加载未复核）。讯飞输入法 PC 版默认 F6 单键+长按说话（pconline/3DM/ghxi 教程）——竞品基线，未实测其延迟。
+- **竞品/社区对"面板出现延迟"的讨论**：未找到任何量化"按下→微信电平图出现"的公开评测（横评均测识别速度/准确率）；游戏侧有 PTT 激活延迟 1s-5s 的社区案例（Overwatch 官方论坛、Valorant Reddit），第三方全局钩子（如 Razer Synapse）可使 PTT 延迟 3-5s——排查本机钩子干扰的依据。
+- **本专项实测结论（evidence/p，2026-09-05）**：注入→WeType 开麦（ConsentStore 精确 FILETIME 判据）稳定 ~163ms（13 试验 ±5ms），端点预热无效；两型号遥控器实际均直接 0x04 开始推流（历史 GATT 日志 0x08 计数为 0，无可并行的开麦往返）；0x04 通知早于 HID F5 键盘事件 60-90ms 到达（evidence/p 2026-09-04 取证），当前"0x04 到达即注入"已是链路最早合法触发点。剩余 ~215-245ms = BLE/固件（~30-60ms）+ 和弦间隔（20ms）+ WeType 内部处理（~163ms，外部不可合法压缩）。
+- **macOS 版输入目的地/输入源设计（HD838A/remote-mic-app，本机 clone `Documents\Codex\remote-mic-app`）**：`VoiceInputDestinationCoordinator.swift`——语音触发由"聚焦目的地就绪"门控（AX 系统级聚焦快照：role ∈ {AXTextArea/AXTextField/AXComboBox} + enabled + editable + 非保护内容 + 语义文本不含 password/search/设置 等敏感词；不就绪 UI 提示等待/不可用，5s 超时不注入）；`PreferredInputSourceMonitor`——保证配置的语音工具是活动输入源。**Windows 版 IME 专项（2026-09-05）借鉴其输入源职责**：实测 WeType 语音热键仅在自身为会话活动输入法时生效（微软拼音活跃 2/2 不触发、切回 2/2 恢复、激活后零延迟注入 3/3 触发，evidence/p），已实现 `ime.rs`（TSF `ActivateProfile` + `TF_IPPMF_FORSESSION` 会话级激活，公开 API，失败不阻断）。macOS 的 AX 聚焦目的地门控在 Windows 未采用——焦点实验证明 WeType 开麦不依赖文本焦点（6/6，桌面/资源管理器照常触发），聚焦门控留给未来 UIA 版本按需评估。
+
+- **macOS 版「聚焦输入框」行为规格（HD838A/remote-mic-app，2026-10-02 复核）**：Windows 版动作「聚焦输入框」与「打开应用后的聚焦方式」按 mac 版语义实现（`KeyboardInjector.swift` 的 `focusInput` 动作、`RemoteButtons.swift` 的聚焦策略、`SettingsView.swift` 的「学习输入框」交互）。只沿用行为口径（动作语义、三种聚焦方式、学习窗口交互、失败分类），平台实现全部重写为公开 UI Automation：mac 用 AX 系统级聚焦快照（role / editable / 敏感词）与 12 × 250 ms 重试窗口；Windows 用 UIA 的 `ControlType` / `IsKeyboardFocusable` / `ValuePattern.IsReadOnly` / `IsPassword` / `TextPattern` 与 8 × 200 ms（实测单次扫描 20–200 ms）。mac 的「相对位置点击」兜底在 Windows **未启用**（决策点 D1/D2 未拍板），无 UIA 树的应用只提供「只打开应用 + 提示」。实测依据见 `docs/investigations/2026-10-01-windows-input-focus-uia-feasibility.md`。
+
+## BLE 僵死链路自动恢复调研来源（2026-09-05，重连健壮性专项）
+
+场景：应用被强杀（未走正常关闭）后 Windows 侧残留僵死 GATT/HID 链路或服务缓存，普通重试永不恢复（本机真机取证：CCCD 订阅写入 E_ABORT、HID 接口从系统消失；examples\radio_probe 与 examples\gatt_snoop 探针复现）。已实现 `bluetooth_radio.rs` 自动恢复：重连连续失败达阈值时关开蓝牙无线电；每窗口最多 2 次并在 60 秒冷却后重开窗口，避免无限普通重连；应用启动时预取 Radio 对象与权限，避免故障发生后 WinRT 枚举自身也返回 `0x80070008`。2026-09-13 依据微软 `Close` 所有权边界与 MS Q&A 99038 的 service/device 成对释放结论，进一步补齐连接构建中途失败的全量显式清理；此前仅订阅后期分支清理，会让普通重试自身可能累积 WinRT BLE 资源。真机验证：系统栈健康时无线电开关周期后重连循环立即成功（Testing\investigation\sayall-gatt-20260905-live.log T/C 能力交换取证）；预热缓存和失败路径清理版僵死态仍待安装包复验。关键参考：
+
+- **微软官方 GATT 客户端文档**（Dispose 后系统"小超时"自动断开、重建设备对象按需重连；BluetoothLEDevice.Close 仅当本应用是唯一持有者才关连接；GATT 连接/发现可能因系统队列等待数分钟且当前不能取消）：`learn.microsoft.com/windows/apps/develop/devices-sensors/gatt-client`、`learn.microsoft.com/uwp/api/windows.devices.bluetooth.bluetoothledevice.close`
+- **微软 BluetoothLEDevice 构造入口文档**：`FromIdAsync` 明确要求从 UI 线程调用（可能触发访问授权）；`FromBluetoothAddressAsync` 无此线程要求，并支持从已进入系统缓存的配对设备地址重建设备对象。2026-09-12 现场的 MTA `FromIdAsync` 先返回 Windows 资源错误，后续日志时序显示下一次请求占住 BLE 工作线程（阶段日志缺失，属结合代码的推断），故改用配对 AssociationEndpoint ID 内的对端地址调用后者；不记录真实地址。官方依据：`learn.microsoft.com/uwp/api/windows.devices.bluetooth.bluetoothledevice.fromidasync`、`learn.microsoft.com/uwp/api/windows.devices.bluetooth.bluetoothledevice.frombluetoothaddressasync`。
+- **MS Q&A 99038**（只 Dispose 设备不 Dispose 服务则无法重连）、**MS Q&A 2280559**（RPA 解析滞后导致进程重启后首次 GetGattServicesAsync 必 Unreachable，官方建议 3 次重试 ×1s + Uncached）、**MS Q&A 1685221**（FromBluetoothAddressAsync 返回 null 僵死 bug，Win11 2024.01D 已修；MaintainConnection 遇 bond 丢失会重连循环）
+- **Qt 论坛 156281**（实测：OS 侧服务缓存僵死，重启应用无效，**关开蓝牙是唯一有效修复**——与本机取证一致，是本仓库选择无线电恢复的直接依据）：`forum.qt.io/topic/156281`
+- **ZSTDJan/windows-remote-mic-app**，提交 `af54fd8e85a70f5b8f19cd4fa5bf11fe7fe530d6`，`apps/windows/rc003/src/ovb_rc003/ble_transport_winrt.py`（2026-09-14 复核）：参考实现从已配对 BLE selector 取得设备 ID 后调用 `FromIdAsync`，以 Uncached 发现服务；关闭时先取消写入/停止工作线程，再关闭 CCCD、退订事件并依次 Close service/device，且保留关闭失败的所有者供后续再次释放。本仓库据此修正 `BleSession::close` 首次 Close 失败后只回放旧错误、没有真正重试的缺陷。没有照搬其连接入口：同一僵死现场实测该配对 ID 路径返回 `0x80004004`，直接 GATT selector 返回 `0x80070008`，证明换构造入口不能恢复已经失效的系统栈。
+- **Windows PnP 自动恢复公开接口**（2026-09-14）：微软 PnPUtil 文档提供 `/restart-device <instance ID>`，设备节点变更需要管理员权限；`ShellExecuteExW` 的 `runas` verb 用于显示系统 UAC 并启动提权操作；SetupAPI `SetupDiGetClassDevsW`/设备属性用于只选择当前存在、服务为 `BTHUSB` 的唯一蓝牙适配器。实现不记录实例 ID、不接受外部命令或路径，并在工具退出后独立用 WinRT Radio 枚举验证，而不信任单独的进程退出码。官方依据：`learn.microsoft.com/windows-hardware/drivers/devtest/pnputil-command-syntax`、`learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw`、`learn.microsoft.com/windows/win32/api/setupapi/nf-setupapi-setupdigetclassdevsw`。
+
+### 2026-09-16 A/B 对照：无线电 Off/On 在僵死态无可观测收益
+
+上节 Qt 156281「关开蓝牙是唯一有效修复」的适用边界已用现场日志划定（证据
+`artifacts/ev_stream_raw.txt`，0.2.6，僵死现场，2983 条 `ble_connect` 记录）：
+
+| 组 | 样本 | 恢复 | 恢复率 |
+| --- | --- | --- | --- |
+| 实验组：Off/On 之后首次重连 | 488 | 3 | **0.61%** |
+| 对照组：同事件内普通重试（`attempt>=1`） | 2406 | 15 | **0.62%** |
+| （参考）进程冷启动 `attempt=0` | 89 | 26 | 29.21% |
+| （参考）Off/On 自身报 `failed` | 345 | 0 | 0.00% |
+| （参考）Off/On 自身报 `passed` | 143 | 3 | 2.10% |
+
+两组相差 **-0.01 个百分点**（判定阈值 ±10），双比例 z 检验 z=-0.022 / p=0.982，
+95% Wilson 置信区间实验组 0.21%–1.79%、对照组 0.38%–1.03%（大幅重叠）。
+即：开关与不开关在统计上不可区分。旁证：Off/On 自身报告成功 143 次，其后也只恢复
+3 次——**"WinRT 说开关成功"不等于"碰到蓝牙栈"**，原因是启动预热缓存的 Radio 对象
+让 Off/On 命中缓存而非真实栈。这解释了 Qt 156281 的结论只在**系统栈健康**时成立，
+僵死态不成立。
+
+引用措辞边界：只能说"无可观测收益，不值得保留一条会打断链路的路径"，
+**不能**说成"零效果"（实验组 CI 上限 1.79%）。
+
+据此改为**按错误码分流**（`bluetooth_radio::is_stack_exhausted`）：命中
+`windows_resource_exhausted` / `winrt_operation_aborted` 时跳过 Off/On 与 PnP 重启，只留普通
+重连，日志落 `ble_recovery_decision action=skip_recovery reason=stack_exhausted_proven_ineffective`；
+非僵死码仍走原 Off/On 路径保留兜底。复算脚本 `scripts/analyze-radio-recovery-ab.py`，
+操作与判读标准见 `Testing/WindowsBleResourceRecovery.md`。
+
+### 2026-09-10 重连窗口 F5 泄漏补充
+
+- **微软 `RegisterRawInputDevices` 文档**：同一进程、同一 Raw Input 设备类只能
+  有一个接收窗口，最后一次注册覆盖前者；文档因此明确警告库内注册会干扰宿主
+  自己的 Raw Input 处理。该约束解释了旧版 `key_suppressor.rs` 的键盘注册被
+  `raw_input_windows.rs` 覆盖、断线期 F5 设备归因失效：
+  `learn.microsoft.com/windows/win32/api/winuser/nf-winuser-registerrawinputdevices`。
+- **参考实现复核**：本机 `reference-repos/vibe-flow` 提交
+  `b47f7cdce8b753fade0c64c97332bebe80f17d2d` 的 `VoxDeckInputBridge.cs` 对语音
+  F5 使用 LL 钩子兜底，并在重连扫描码变化时仍以持久语音映射为准；它接受实体
+  键盘 F5 冲突。本仓库采用边界更窄的做法：主 Raw Input 窗口统一归因，只有
+  Connecting/Discovering/AwaitingCapabilities/Reconnecting 建链窗口临时兜底，
+  稳定状态继续保留实体键盘 F5。
+- **记事本行为旁证**：Microsoft Q&A 的 Windows/Notepad 条目确认 F5 会插入当前
+  日期时间。2026-09-10 本机现象格式与系统区域格式一致，结合诊断日志
+  `seen=74 swallowed=0 leaked=74`，可排除 ASR 把语音识别成日期的解释。
+- **Bleak winrt client 源码**（Unreachable 重试 10×1s；断开全量清理序列 CCCD=None→退订→逐服务 Close 带 0.1s 防挂起延迟）、**btleplug winrtble**（Uncached 触发连接、特征发现 5s 超时回退 Cached——#325：部分驱动 Uncached 请求无限挂起，本仓库 connect 尚无该超时，列为后续加固项）、**微软官方 BluetoothLE 示例 Scenario2_Client**（FromIdAsync→RequestAccessAsync→Uncached 发现→清理序列）
+- **Windows.Devices.Radios.Radio**（微软 `RequestAccessAsync` / `SetStateAsync`
+  文档）：改变无线电前先请求权限并检查 `RadioAccessStatus::Allowed`；
+  `SetStateAsync` 返回只表示请求是否获准，实际状态异步转换，应观察
+  `StateChanged` 或复读 `State` 确认。2026-09-12 统一包实测旧实现 0-5ms
+  即误判两轮恢复失败，据此改为进程内缓存 Allowed、Off/On 有界复读确认。
+  微软还说明 `RequestAccessAsync` 可能触发授权，应从可交互 UI 上下文调用；
+  Radio 可由 `GetRadiosAsync` 枚举，也可从已知 ID 创建。2026-09-13 现场证明
+  系统资源耗尽后这三种取对象入口均返回 `0x80070008`，因此改为 Tauri setup
+  阶段先取得并缓存对象，恢复线程只复用缓存；若启动预热失败但 BLE 后续恢复，
+  则立即补建缓存。该设计只使用公开 Radio API，不引入提权或驱动。
+  官方依据：`learn.microsoft.com/uwp/api/windows.devices.radios.radio.requestaccessasync`、
+  `learn.microsoft.com/uwp/api/windows.devices.radios.radio.getradiosasync`、
+  `learn.microsoft.com/uwp/api/windows.devices.radios.radio.setstateasync`。
+- **Radio 设备查询兜底**（微软 `Radio.GetDeviceSelector` / `Radio.FromIdAsync`
+  文档）：官方允许以 AQS + `DeviceInformation.FindAllAsync` 枚举后通过 ID
+  重建 Radio，并说明硬件异常/移除场景下它比 `GetRadiosAsync` 更可靠。
+  2026-09-12 现场两条路径均返回 `0x80070008`，据此把“公开 API 已穷尽”的
+  人工提示边界固定下来。官方依据：
+  `learn.microsoft.com/uwp/api/windows.devices.radios.radio.getdeviceselector`、
+  `learn.microsoft.com/uwp/api/windows.devices.radios.radio.fromidasync`。
+
+外部实现只作为带来源的参考。第三方应用进程注入、私有配置读取和来源不明二进制不进入稳定主路径。
+
+## Windows 注册应用激活与前台验收（2026-09-26）
+
+- **`IApplicationActivationManager::ActivateApplication`**：微软文档定义它按 AUMID
+  激活当前会话中的通用启动契约，并返回承接契约的进程 ID。本仓库用它替代 AppsFolder
+  路径中仅投递 `ShellExecuteExW` 的主路径；传统桌面注册项仍保留 Shell 回退。官方依据：
+  `learn.microsoft.com/windows/win32/api/shobjidl_core/nf-shobjidl_core-iapplicationactivationmanager-activateapplication`。
+- **AUMID 与多进程应用**：微软说明 AUMID 用于把应用的窗口、进程和资源关联起来，
+  不依赖应用内部是单进程还是多进程；`GetApplicationUserModelId` 可从公开进程句柄读取
+  该身份；窗口级 `System.AppUserModel.ID` 可覆盖进程级身份，用于共享宿主或同进程多应用。
+  因此不能假定激活契约 PID 就是主窗口 PID，本仓库先按窗口级、再按进程级精确 AUMID
+  枚举，最后以 `GetForegroundWindow` 读回验收。官方依据：
+  `learn.microsoft.com/windows/apps/desktop/modernize/package-identity-overview`、
+  `learn.microsoft.com/windows/win32/appxpkg/functions`、
+  `learn.microsoft.com/windows/win32/properties/props-system-appusermodel-id`。
+- **传统 AppsFolder 条目**：微软将 `System.Link.TargetParsingPath` 定义为链接项真实目标
+  的 Shell 命名空间路径，文件目标时等同于显示路径；`IShellItem2::GetString` 是读取该
+  PROPERTYKEY 的公开接口。本仓库用它取得完整 exe 路径，匹配所有同路径运行进程，
+  避免误把 Shell 返回的启动器 PID 当主窗口，也避免仅按文件名造成跨目录碰撞。官方依据：
+  `learn.microsoft.com/windows/win32/properties/props-system-link-targetparsingpath`、
+  `learn.microsoft.com/windows/win32/api/shobjidl_core/nf-shobjidl_core-ishellitem2-getstring`。
+- **边界**：只读取 Windows 公开的应用身份，不读取 ChatGPT 或其他第三方应用的私有
+  配置、数据库或进程内存；日志不记录 AUMID、窗口标题、路径或应用名称。
+
+## Windows 系统快捷键录入与锁屏动作（2026-09-10）
+
+- **执行端**：微软 `SendInput` 文档说明它把事件串行插入输入流、受 UIPI 与当前键态影响；`LockWorkStation` 是交互桌面进程可调用的公开锁屏 API，成功返回只表示异步锁屏请求已发起。Hooks 文档说明全局钩子事件局限于调用线程所在桌面。按键映射中的精确 `Win+L` 因而先等待实体键释放、由门控成对处理 DOWN/UP，再调用 `LockWorkStation`；其他快捷键仍走既有 `SendInput` 并保持按下即响应。官方依据：`learn.microsoft.com/windows/win32/api/winuser/nf-winuser-sendinput`、`learn.microsoft.com/windows/win32/api/winuser/nf-winuser-lockworkstation`、`learn.microsoft.com/windows/win32/winmsg/hooks`。
+- **录入端**：微软 `LowLevelKeyboardProc` 文档明确低级键盘钩子在按键消息进入目标线程队列前运行，处理后返回非零可阻止继续传递，并要求回调快速把工作移交后台线程。本仓库复用常驻 `WH_KEYBOARD_LL` 门控：录入期间先吞物理 DOWN，所有对应重复 DOWN/UP 即使录入已经结束仍按同一次按住吞完；录入开始前已经按住的键则全程放行，避免不对称边沿。钩子只 `try_send`，Tauri 事件由独立线程发出。官方依据：`learn.microsoft.com/windows/win32/winmsg/lowlevelkeyboardproc`。
+- **边界**：`Ctrl+Alt+Del` 等安全注意序列不属于普通快捷键录入能力；Win+L 在当前
+  Windows 主机上即使低级钩子返回吞下仍会锁屏。因此自定义录入默认保留直接模式，
+  并提供用户显式开启的“界面选择修饰键 + 物理键盘只按主键”安全模式；安全模式
+  不在输入流中生成系统组合。
+- **钩子链顺序补充（第二轮现场复验）**：微软 Hooks Overview 说明钩子按链调用，
+  已处理事件可停止继续传给后续钩子/目标；`LowLevelKeyboardProc` 也明确非零返回
+  阻止后续传递。现场观察到本钩子吞下 Win/L 后仍被系统锁屏；链首重挂又导致边沿
+  完全丢失，实证 failed 并回退。产品路径不再依赖钩子链顺序屏蔽系统保留组合。
+  官方依据：`learn.microsoft.com/windows/win32/winmsg/about-hooks`、
+  `learn.microsoft.com/windows/win32/winmsg/lowlevelkeyboardproc`。
+- **TV→锁屏的协议选择器兜底（2026-09-12）**：微软 Raw Input 文档明确
+  `RIDEV_NOLEGACY` 只适用于鼠标/键盘，不能据此阻止消费控制 HID 的独立 Shell
+  动作；`SetWinEventHook` 提供跨进程、out-of-context 的对象事件观察，
+  `EVENT_OBJECT_CREATE` 早于 SHOW。现场证明 Windows 会在 SayAll 锁屏约 4 秒后
+  由系统服务创建 `OpenWith.exe`；SHOW 阶段隐藏仍偶发闪帧，CREATE 阶段终止精确
+  helper 连续四轮无可见弹窗。产品路径只在“已观察 TV→下一次 SayAll 锁屏”的
+  15 秒窗口启用，并只处理 Windows `System32` 下映像名精确为 `OpenWith.exe`
+  的进程。官方依据：
+  `learn.microsoft.com/windows/win32/api/winuser/ns-winuser-rawinputdevice`、
+  `learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setwineventhook`、
+  `learn.microsoft.com/windows/win32/winauto/event-constants`、
+  `learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess`。
+
+## WeType 热键休眠自动恢复调研来源（2026-09-05，热键休眠专项 v2）
+
+场景：WeType 2.1.3.18 后台约 40 分钟后"TSF 存活但全局键盘钩子休眠"——和弦注入 LWin 穿透、无 0xFC、ConsentStore 时间戳不动；打开 WeType 任意自身界面立即复活（kb-live 会话 23-26 真机取证）。跨进程 `SetProcessInformation(ProcessPowerThrottling)` 解除节流**真机证伪**（对其他进程 E_INVALIDARG 0x80070057，wetype_service 打开即 0x80070005，15:04 live12 取证），该路线已从 `wetype_revive.rs` 移除。v2 已实现（`ble.rs` + `ime.rs`）：检测（注入后 700ms ConsentStore 时间戳未动）→ TSF 配置切换唤醒（`cycle_wetype_profile`：激活微软拼音 80ms 后切回，公开 API）→ 300ms 后经 `WorkerMessage::RetryVoiceChord` 在工作线程释放旧和弦并重注入 → 二次检测未响应才提示人工。关键参考与实测：
+
+- **TSF profile 管理 API**（`ITfInputProcessorProfileMgr::ActivateProfile`/`EnumProfiles`，`TF_IPPMF_FORSESSION` 会话级激活）：微软官方文档 `learn.microsoft.com/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-activateprofile`。选择理由：切换配置会向所有 TSF 感知进程广播激活事件，是唯一能从外部触达 WeType 的公开 API 路径。
+- **会话 47 真机实测（live13 + kb-live.log 全解码，2026-09-05 15:21）**：休眠中按键 → 检测未响应 → 配置切换真实完成（STA 线程，切微软拼音 clsid 9D2B2E2B 再切回）→ **346ms 后重注入的和弦同样未开麦**（LL 钩子日志见注入的 5B 边沿泄漏可见、无 0xFC 标记）。
+- **16:44-17:35 七次休眠发作实测（kb-live.log，2026-09-05 晚间复盘）**：用户大量使用语音键期间钩子反复休眠/复活，七个发作簇全部同构：首和弦失败（5B 泄漏）→ v2 自动重试（cycle+300ms 时序精确吻合）**7/7 失败**→ 用户在 cycle 后 **1.24/1.28/1.68/1.85/1.9/2.28s** 的再按全部成功（FC 标记 + ConsentStore 开麦交叉验证）。**结论：配置切换确实能复活休眠钩子，复活延迟实测 ∈ (300ms, ~2.3s]（一次疑似 ≤6s）**；+300ms 重注入恒过早。注意：该时段应用为并行会话部署的无日志实例（pid 11692，含共享分支上的 v2 代码），cycle 隐形运行——与 kb-live 时序吻合。据此实现重试阶梯（WETYPE_RETRY_SETTLE_MS=[2000,3000]，两轮 cycle+重注入，最后才提示人工）。
+- **LL 钩子日志判据（2026-09-05 新增，kb-live.log 全天 128 和弦窗口解码）**：WeType 钩子存活时**消费注入的和弦 LWin 边沿并注入自己的 0xFC 标记对**（每边沿一对瞬时 D/U）；钩子休眠时 5B 边沿泄漏可见、无 0xFC。此判据与 ConsentStore 开麦时间戳 100% 交叉验证一致，成为"钩子死活"的即时观测手段（无需开麦）。全天时间线（毫秒时间戳锚定）：休眠形成于 15:08:21（最后一次成功会话结束）→15:16:10（首次失败）之间的**方向键-only 活动窗口（≤8 分钟）**；此前 14:13、15:04 等休眠段落与手动复活（打开 WeType 界面）全部对齐。**休眠形成是偶发的**：15:21:34 复活后钩子存活 ≥80 分钟（跨两次探针开麦会话、用户离开/打字交替），未再休眠——"40 分钟规律"不成立，形成条件未定。
+- **健全性实测（2026-09-05 16:41 持锁）**：cycle profile（STA）后 1s 注入和弦照常开麦——**配置切换不破坏活钩子的和弦触发**，v2 复活路径前提成立。剩余验证：重试阶梯版待下一次自然休眠发作做端到端确认（一次按住内自动恢复）。
+- **首按失败根因终局定论与验证（2026-09-05 21:34-21:38，commit 1b55cca 部署后）**：真正的根因是 **F5 泄漏三键拒绝**——遥控器闲置后应用自身被后台节流，0x04→抑制器武装的链路（经工作线程队列）拖 ~120ms，F5 的 60ms 有界等待超时泄漏 → 和弦变成 F5+Ctrl+Win 被微信输入法拒绝；断连重连变体中首个 F5 在 0x04 前泄漏、UP 丢失致 OS 键态粘 F5。修复（三重防线）：GATT 回调线程直接武装 + 和弦前 F5 解粘 UP + 抑制器决策计数日志。**验证结果：4/4 会话首按成功**（含一次 25 分钟闲置后首按），suppressor_stats leaked=0（135 个 F5 全部吞下，其中 1 个冷启动 F5 由 GATT 回调武装+有界等待兜住），kb-live 零 F5 D 泄漏、全部和弦带 FC 成功标记，解粘 UP 按设计仅在需要时进入 OS。"WeType 钩子休眠"理论正式退役：全部证据与 F5 泄漏 + 20ms 间隔冷态拒绝两个机制一致；重试阶梯保留为无害安全网。
+- **`SetProcessInformation` 权限边界**：微软文档明确 ProcessPowerThrottling 仅作用于调用进程自身；对其他进程返回 E_INVALIDARG。真机取证一致（live12）。
+- **WeType 进程布局（本机取证）**：开麦方为 `wetype_update.exe`（ConsentStore 条目，拥有顶层窗口 StatusBarWnd）；另有 wetype_service/wetype_server/wetype_renderer。休眠的是钩子所在后台进程，TSF DLL 运行于前台应用进程内不受影响——这解释了为何 TSF 路径（中文输入）存活而全局钩子休眠。
+
+## 应用内更新（tauri-plugin-updater + GitHub Releases）调研来源（2026-09-05）
+
+场景：Windows 应用内"检查更新 + 下载安装"（GitHub-only、零自建服务器）。关键行为均以插件源码/官方文档原文核对，非推测：
+
+- **官方 updater 插件文档**（`v2.tauri.app/plugin/updater/`，免费开源，MIT/Apache-2.0）：静态 JSON 端点模式官方示例即 `https://github.com/<owner>/<repo>/releases/latest/download/latest.json`（GitHub 302 到最新**稳定** Release 的资产，草稿/prerelease 不参与 latest）；`latest.json` 必需字段 `version`/`platforms.<target>.url`/`platforms.<target>.signature`，`signature` 为 `.sig` 文件**内容**（非路径）；签名强制不可关闭，私钥丢失即无法再向存量用户推送更新。
+- **tauri-plugin-updater 源码**（plugins-workspace v2，`updater.rs`/`config.rs`，按 2.11.0 核对）：`check()` 对 204 返回"无更新"、200 解析 JSON 后按 SemVer `release.version > current` 判定；平台键按 `windows-x86_64-nsis` → `windows-x86_64` 顺序回退查找（latest.json 只需提供 `windows-x86_64`，dev 与 NSIS 安装态通用）；`Update.timeout` 默认 None（下载不限时），builder 的 timeout 只作用于 check 请求；下载完成后**先验签**再安装。**Windows 安装时序**：`install_inner` = 解包 → `on_before_exit` 回调 → `ShellExecuteW` 启动安装器（NSIS 参数 `/P`（passive）+ `/UPDATE` + `/R`（装完自动重启应用））→ `std::process::exit(0)`——**Drop 清理不会执行**，必须把 BLE 断开等成对清理放进 `on_before_exit`（本仓库 2026-09-05"部署不得强杀/强杀残留"教训的更新路径版）；`config.rs::validate_endpoints`：debug 构建 http 端点仅警告放行，release 构建强制 https（本仓库本地 E2E 用 `SAYALL_UPDATER_ENDPOINT` 覆盖端点 + dev 构建走 http，正式配置不含任何 dangerous 开关）。
+- **tauri-cli/bundler 构建约束**（tauri issues #13259、#15638 + 组织讨论 #6013 佐证，并在本机复验）：`tauri.conf.json` 配置 `plugins.updater.pubkey`（及 `createUpdaterArtifacts`）后，构建时缺 `TAURI_SIGNING_PRIVATE_KEY` 环境变量会直接失败——现有 Windows CI 的无签名预览构建必须配套处理（无 Secret 时生成一次性临时密钥保 CI 绿灯；正式 Release workflow 缺 Secret 直接失败，防止发布不可用更新包）。
+- **tauri-action**（官方构建+发布 Action，自动生成 latest.json）：评估未采用——它整体接管 build+release，无法嵌入本仓库既有的 verify-windows-bundle、安装生命周期矩阵等既有验收步骤；改为保留既有构建流程 + 自写 `generate-updater-manifest.ps1`（latest.json 生成逻辑对齐 tauri-action 的字段来源：version←tauri.conf.json、signature←`.sig` 文件内容、url←Release 资产直链）。
+- **发布资产命名**：NSIS 产物名含中文与空格（`无线麦 SayAll_*.exe`），GitHub 资产直链需 percent-encoding；为消除编码风险，Release 资产在 CI 中复制为纯 ASCII 名（`SayAll-Windows-<version>-x64-setup.exe`）后上传，本地构建产物名不变（CI 全部脚本按 `*-setup.exe` 过滤定位，实测不受新增 `.sig` 影响）。
+- **NSIS 与既有安装器门禁的相互作用**：updater 以 `/P`（passive）+ `/UPDATE` 运行，既有 installer-hooks.nsh 的 PREINSTALL SemVer 降级门禁照常生效（升级路径不受影响）；POSTINSTALL 的 VB-CABLE 提示在 passive（非 Silent）模式下仍会弹出——仅影响未装 VB-CABLE 的用户，与首装行为一致，保留。
+- **预览版通道（2026-09-08 增补）**：Tauri 官方 Runtime Configuration 文档明确支持通过 `UpdaterBuilder::endpoints` 在运行时选择 stable/beta 等独立通道；本仓库据此保持默认稳定端点不变，仅在用户显式开启“检查预览版更新”后覆盖端点。GitHub Releases 页面公开提供标准 Atom feed（`releases.atom`），包含已发布的正式版与 Pre-release、排除 Draft；实现从本仓库 feed 的 `alternate` 链接读取 SemVer tag，选择最高版本并自行构造本仓库 `https://github.com/GetSayAll/remote-mic-app-windows/releases/download/<tag>/latest.json`，避开匿名 REST API 每 IP 60 次/小时限流。最终安装包仍由 Tauri minisign 强制验签。
+
+## HID 访问模式与免驱动捕获调研来源（2026-09-23，RC003 三键免驱动专项）
+
+- **微软 HID 架构文档 · HID 客户端访问模式表**（`learn.microsoft.com/windows-hardware/drivers/hid/hid-architecture`）：给出各 TLC 的访问模式——**键盘/键台（`0x01`/`0x0006–0x0007`）与鼠标（`0x01`/`0x0001–0x0002`）为 Exclusive**；游戏控制器、`0x01`/`0x0080` 系统控制、`0x0C`/`0x0001` 消费类、厂商自定义页均为 Shared。文档原文：为阻止其他 HID 客户端截获全局输入状态，**"Raw Input Manager (RIM) opens all such devices exclusively"**；RIM 独占打开后，应用仍可**不请求读写权限**地打开 HID 设备接口，并只能用 `HidD_GetXxx` 取设备信息。本条直接解释了本仓库实测到的 `CreateFile(GENERIC_READ)` → `ERROR_ACCESS_DENIED`、以及零权限打开成功但 `DeviceIoControl(IOCTL_HID_GET_REPORT_DESCRIPTOR)` → `ERROR_INVALID_FUNCTION`。
+- **适用边界**：该表用于判定"某个 TLC 在当前 Windows 上能否被**普通用户态**进程读取"。本仓库据此得出 RC003 **不提权直读**不可行的结论；不涉及任何第三方实现代码，无代码来源需要标注。**注意**：该结论仅覆盖"不提权、不注入"的范围——报告的生产端位于 `WUDFHost` 内、在 RIM 之前，提权注入该宿主可读，见本文下方的「HID 宿主内报告层捕获」条。
+- **实测交叉验证**（本机 2026-09-23）：17 个 HID 设备接口中 8 个打开成功（全部为 Shared 模式：消费类 / 厂商页 / 笔），9 个被拒（全部为键盘类）；RC003 的唯一 TLC 为 `Generic Desktop / Keyboard`，因此落在 Exclusive 一侧。原始输出见 `hardware/RC003/evidence/hid-direct-control.log`。
+- **`HidP_GetButtonCaps` / `HidP_GetCaps` / `HidP_GetLinkCollectionNodes`**（`hid.dll` 公开 API）：用于在**不读取报告**的前提下枚举设备**声明**的 usage 与报告结构；这是本轮判定"三键（`0x80`/`0x81`/`0xF1`）确实被设备声明在 `report_id=0x01` 的键盘页范围内"的依据（证据同上）。
+- **`RegisterRawInputDevices` 的匹配语义**：注册项按 TLC 的 usage page / usage 匹配。RC003 的 TLC 是 `0x01`/`0x0006`，因此厂商页 `0xFF00/0x0001` 注册项在原理上无法匹配该设备；本仓库仍实测之（`hardware/RC003/probes/raw-input-dump.py`）以把预期变成可核验的事实——结果为零事件，与原理一致。
+
+## HID 宿主内报告层捕获（2026-09-23，RC003 三键实现复核专项）
+
+按用户要求复核 `ZSTDJan/windows-remote-mic-app` 的按键捕获实现，记录其机理、上游与依赖。
+**只读复核，未复制任何代码**；本仓库与参考实现同为 GPL-3.0-only，若后续移植代码须按本文件规则登记模块与提交。
+
+- **参考实现**：`ZSTDJan/windows-remote-mic-app`，提交
+  `1e6b1d285f9cd50f30c5bc92ac7787a693fc993d`（`main`，v1.0.44，2026-09-14）。
+  - **技术上游**：该方案源自 `xxb26553663-star/remote-bridge-hub`，提交
+    `8a93f321ac71a602300c6cd77f7256fa4b63068e`（GPL-3.0-only）。ZSTDJan 自己的
+    `frida_compat.py` 开篇即写明：*"Windows' normal keyboard stack does not expose the RC003
+    usages for Back and the two volume buttons. The original `remote-bridge-hub` Windows client
+    solves that by observing the completed HID read inside the RC003 WUDF host via a verified
+    Frida Gadget."* 引用时应同时点出上游，避免把二手适配当原始出处。
+  - **关键模块**（供移植时按模块登记）：`apps/windows/rc003/src/ovb_rc003/`
+    下的 `frida_hid_tap_runtime.py`（宿主定位、独占性判据、内嵌 Gadget 脚本）、
+    `frida_hid_tap_injector.py`（提权与注入）、`frida_compat.py`（客户端、usage→按钮表、租约与降级）、
+    `hid_host_reload_windows.py`（旧世代 Gadget 迁移）；架构说明以其
+    `WINDOWS-ARCHITECTURE-LEDGER.md` §6–§8、§12 为准。
+- **机理**：RC003 的 HID 设备由 `mshidumdf` + `WUDFRd`（`WUDF\DriverList = HidOverGatt`）承载在
+  **用户态** `WUDFHost.exe` 中。在该进程内挂 `ntdll!NtDeviceIoControlFile`，命中
+  `IoControlCode = 0x80018483`、`inputLength = 8`（`input[4] = 2` operation、`input[5] = 1` selector）、
+  `outputLength = 9` 时，把 9 字节键盘报告（`report_id 0x01` + modifiers + reserved +
+  3 × uint16 usage）中偏移 3 起的 6 字节 usage 槽**在 `onEnter` 清空**，再把原文交回应用侧做
+  手势与映射。清空必须在 `onEnter`——内核在调用返回前已复制源缓冲区，`onLeave` 清空太晚。
+  **不使用 Raw Input**，因此与"Raw Input HID 通道零报文"并不矛盾。
+- **依赖与代价**：无需内核驱动、无需 `TESTSIGNING`、不改 Secure Boot 与驱动签名策略、无需重启；
+  代价为**提权组件**（参考实现为固定计划任务承载的 `RemoteMicRC003HidHelper.exe`，
+  不接受调用方传入的 PID/路径/配置）+ **Frida Gadget 17.15.3**
+  （`frida-gadget-17.15.3-windows-x86_64.dll.xz`，SHA256
+  `b566d70189b6d551ad8f4e0bea24de08a3d4c0f559bb35b2bdb67d45182240c2`，独立许可，非 GPL）。
+  注入使用 `SeDebugPrivilege` + `VirtualAllocEx`/`WriteProcessMemory`/`CreateRemoteThread(LoadLibraryW)`。
+- **本仓库自用探针的依赖登记（2026-09-23）**：本仓库的只读 / 写入实验探针
+  （`hardware/RC003/probes/wudf_ioctl_tap.{js,py}`、`wudf_ioctl_write.{js,py}`、
+  `raw_input_sink.py`）使用 **Frida 官方 Python 绑定 17.18.0**（独立许可，非 GPL）在**开发期**
+  完成宿主定位与脚本注入，**不随产品发布**；探针的 hook 脚本为本仓库自持实现（未复制参考实现代码，
+  仅按公开 IOCTL 行为独立编写）。产品若采用路线 A，注入框架（含 Frida Gadget）须按
+  ADR 0002 修订记录**固定版本 + 校验 SHA256 + 在本文件登记来源与许可**后再引入
+  —— 该登记见下一条。
+- **产品注入载体登记：Frida Gadget 17.18.0（2026-09-23，路线 A 助手产品化 spike）**。
+  按 ADR 0002 §3 修订记录的要求完成"固定版本 + 校验 SHA256 + 登记来源与许可"三件事。
+  - **来源**：`frida/frida` 发行 tag `17.18.0`（2026-09-09），资产
+    `frida-gadget-17.18.0-windows-x86_64.dll.xz`，
+    下载地址 `https://github.com/frida/frida/releases/download/17.18.0/frida-gadget-17.18.0-windows-x86_64.dll.xz`。
+  - **完整性**：压缩包 SHA-256 `2e549d3b77bc939b83b9a368655e90b7e566bd56b635a10fc3fab68d8dbe173d`
+    （与 GitHub Releases API 的 `asset.digest` 逐字符一致，非本地自证）；解压产物
+    `frida-gadget.dll` 23 254 016 字节，SHA-256
+    `350beb0e801dc7dc39d21512960d1048b9f21dc72c0ee5ced5cf5d9dc8ea6687`，PE machine `0x8664`（x86_64）。
+  - **固定方式**：机器可读清单 `hardware/RC003/helper/vendor/frida-gadget.lock.json` 是版本与
+    完整性的**唯一事实来源**；`hardware/RC003/helper/vendor/fetch_frida_gadget.py` 按锁定值
+    下载并逐级校验（压缩包哈希 → 解压 → 产物哈希 → PE 头与架构），任何一步不符即非零退出，
+    **不留下未校验的 DLL 供助手加载**。二进制本身不入库（见 `.gitignore`），入库的是
+    "可复现的获取方式 + 锁定的完整性凭据"。
+  - **许可**：**wxWindows Library Licence, Version 3.1**（`frida/frida` 仓库根 `COPYING`）。
+    该许可的 exception notice 第 2 条明确：*"you may use, copy, link, modify and distribute
+    under your own terms, binary object code versions of works based on the Library."*
+    ⇒ **以二进制形式随本产品分发被允许，无需开源本产品代码**；第 3 条同时说明该例外
+    不适用于"并入库中的 GPL/LGPL 代码"。与参考实现所用的 17.15.3 属同一许可族（均非 GPL）。
+  - **残留风险（发布前须收口）**：本次仅核对了仓库根 `COPYING`，**未做逐组件许可复核**
+    （Gadget 内嵌的第三方组件未逐一确认）。正式发布前应完成逐组件复核，并把许可全文随安装包
+    一并分发。在此之前该组件**仅用于开发期与增强轨验证**。
+  - **使用边界**：基础语音主路径不得依赖本组件（`AGENTS.md` 架构边界条款）。助手只承载
+    "按设备源头捕获"这一可选增强轨，未就绪时按键回到 Windows 原生行为。
+- **产品注入载体登记（arm64 架构）：Frida Gadget 17.18.0（2026-10-07，Issue #206 / ADR 0003）**。
+  与上一条同一发行 tag，按架构各登记一条（ADR 0003 §6）。本机无 ARM64 主机、无 ARM64
+  工具集，本条目只登记来源与完整性；ARM64 上的实际可用性尚未验证（deferred）。
+  - **来源**：`frida/frida` 发行 tag `17.18.0`，资产
+    `frida-gadget-17.18.0-windows-arm64.dll.xz`，
+    下载地址 `https://github.com/frida/frida/releases/download/17.18.0/frida-gadget-17.18.0-windows-arm64.dll.xz`。
+  - **完整性**：压缩包 5 555 660 字节，SHA-256
+    `9362da1d004c5bac3f42e10a6f5ab13a93a6a9de452015737c15b72fcce5ea90`
+    （与 GitHub Releases API 的 `asset.digest` 逐字符一致，非本地自证）；解压产物
+    `frida-gadget-arm64.dll` 21 078 016 字节，SHA-256
+    `323a91b3842d31c324dafd5e3e504a06d3c8a82f849c05734838a38cb23b17ff`，
+    PE machine `0xAA64`（ARM64，架构正确）。
+  - **固定方式**：与 x64 条目同一机制——机器可读清单
+    `hardware/RC003/helper/vendor/frida-gadget.lock.json` 按架构各记一条，`fetch_frida_gadget.py`
+    按锁定值逐级校验（压缩包哈希 → 解压 → 产物哈希 → PE 头与架构），任何一步不符即非零退出，
+    不留下未校验的 DLL 供助手加载；二进制不入库。`verify_gadget` 的单一 SHA-256 常量按本登记
+    改为按架构两份。
+  - **许可**：与 x64 条目同源同许可——**wxWindows Library Licence, Version 3.1** 及其
+    exception notice 第 2 条（以二进制形式随本产品分发被允许，无需开源本产品代码）；
+    残留风险与 x64 条目相同：尚未逐组件许可复核，正式发布前收口，在此之前仅用于开发期与
+    增强轨验证。
+  - **使用边界**：与 x64 条目相同——基础语音主路径不得依赖本组件（`AGENTS.md` 架构边界条款）；
+    助手按系统原生架构（`IsWow64Process2` 的 `nativeMachine`）选择注入哪一份 Gadget，未就绪时
+    按键回到 Windows 原生行为。
+- **ARM64 注入架构选择的参考实现结论（2026-10-07，Issue #206 调研）**：Frida 自 **16.5.0** 起
+  支持 Windows on ARM——arm64 版按**目标进程架构**选择要注入的 agent，可注入原生 arm64 进程，
+  也可注入在 ARM64 上仿真的 x86_64 / x86 进程（引文见
+  `https://github.com/frida/frida/discussions/3350`）；平台侧边界据微软 Arm64X 文档
+  （`https://learn.microsoft.com/en-us/windows/arm/arm64x-pe`）：**普通 x64 DLL 不能被 ARM64
+  进程加载**，同一镜像要同时服务 Arm64 与 x64/Arm64EC 进程必须构造成 Arm64X/Arm64EC。
+  本仓库据此判定：ARM64 上注入原生 ARM64 的 `WUDFHost.exe` 必须使用 arm64 Gadget，x64 Gadget
+  结构性不可用（与安全软件无关），与 ADR 0003 的"按系统原生架构选择"结论一致。
+- **本仓库只读实测（`structural`，2026-09-23）**：本机 RC003 的宿主节点
+  `Enum\BTHLEDevice\{00001812-…}_Dev_VID&012717_PID&32b8_REV&00a4_…\9&3aacf7b9&0&0055` 声明
+  `Service = mshidumdf`、`LowerFilters = WUDFRd`、`WUDF\DriverList = HidOverGatt`、
+  `DeviceDesc = Bluetooth Low Energy GATT compliant HID device`；
+  `Device Parameters\WUDFDiagnosticInfo\HostPid` 可读且指向 `WUDFHost.exe`；该宿主在整棵
+  `Enum` 树中**只承载 RC003 一个成员**（参考实现的"独占宿主"简单绑定路径适用）；
+  普通权限 `OpenProcess` 返回 `err=5`（宿主位于 session 0，说明注入必须提权）。
+  证据：`hardware/RC003/evidence/wudf-host-probe.log`，探针 `hardware/RC003/probes/wudf-host-probe.py`。
+- **参考实现自陈的风险边界**（引用时应一并保留）：*"该方案沿用既有管理员助手与 Frida，不安装新过滤驱动，
+  不修改 Windows 蓝牙配置或宿主池化设置；它依赖已经验证的 Windows 内部复制语义，
+  **不是微软承诺稳定的公开接口**"*；其 README 亦列出游戏反作弊识别风险。
+- **不要效仿的部分**：其按键映射支持单击/双击/长按配置，与本仓库"语音键只支持按下开始、释放结束"
+  的产品规则冲突——语音键不借鉴其手势策略，只借鉴报告层捕获机理。
+
+## 2026-10-05 WebView2 故障处理来源
+
+- 主窗口有界恢复与相关策略测试改编自本仓库提交 `c89b587bfef1947a7bbde76c353632fa27ca3af0`，作者 **GuoHowe**；上游移植只涉及 `src-tauri/src/lib.rs` 的 WebView2 故障处理，按上游已有退出标记适配，不改 IME、语音或安装器流程。同一作者在其 fork 提交 `adddb0cc210885aff4ba19dec6684d199aa8e31e`（PR #202）中另带一次性原生提示（窗口标题改写、托盘 tooltip、`MessageBoxW`）：该实现未采纳（写标题的判据是 `Reload` 的返回值而非界面是否真的没回来，且写出后没有恢复路径）；本仓库改用心跳判据的标题提示（页面恢复报到即还原），设计见 Bug 记录的 2026-10-07 节。
+- 官方行为参考：[Microsoft WebView2 process-related events](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-related-events)。使用公开 `ProcessFailed`/`Reload` API；浏览器进程退出只能重建控件，本实现只落结构化日志，不伪造恢复；控件重建、托盘 tooltip 与系统对话框未实现；真实故障恢复验收不在已验证范围。
+- 直接依赖复用 Tauri/Wry 已锁定的 `webview2-com 0.38.2`，来源 [wravery/webview2-rs](https://github.com/wravery/webview2-rs)，许可 MIT；没有复制其示例实现。验证边界见 [2026-09-12 Bug 记录的增量节](Bugs/2026-09-12-voice-chord-focused-webview-reload.md#2026-10-05独立的-webview2-故障恢复贡献候选)。

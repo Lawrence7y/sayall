@@ -1,0 +1,215 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'Testing/**'
+      - 'artifacts/**'
+      - 'Screenshots/**'
+      - '.gitignore'
+      - 'LICENSE'
+  pull_request:
+    # 2026-10-03 用户决定：纯文档 PR 恢复 paths-ignore，不产生任何 workflow run。
+    # 此前（2026-09-21）为避开“必需检查 gate 永不出现”而让文档 PR 也跑 gate；
+    # gate 必需检查已同步移除，纯文档改动的 CI 开销归零（见 BRANCH_MANAGEMENT.md）。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'Testing/**'
+      - 'artifacts/**'
+      - 'Screenshots/**'
+      - '.gitignore'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# tauri.conf.json 配置 updater pubkey 后，bundle 构建需要 TAURI_SIGNING_PRIVATE_KEY；
+# Secret 未配置（PR/fork）时由 ensure-updater-signing-key.ps1 生成一次性临时密钥兜底。
+env:
+  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+concurrency:
+  group: windows-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # 触发本 workflow 即代表包含非文档改动（纯文档已在触发器被 paths-ignore 过滤）：
+  # verify 无条件运行完整校验。
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          # arm64 助手的**编译路径**要在 CI 里被真实覆盖（本机常常没有 VS 的 ARM64
+          # 工具集，那条路径永远不会被执行到），因此显式装 aarch64 目标供下方
+          # `cargo check --target` 使用。
+          targets: aarch64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Ensure updater signing key (CI fallback for missing secret)
+        shell: pwsh
+        run: ./scripts/ensure-updater-signing-key.ps1
+
+      - name: Test frontend
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      # tauri.conf 的 bundle.resources 声明了 helper 与 gadget，而这两个文件不入库
+      # ⇒ tauri-build 在编译期就会校验路径存在，先暂存再编译（2026-09-27 PR #127 实测）。
+      # 本 job 不设 SAYALL_REQUIRE_ARM64_PAYLOAD：arm64 载荷在 verify 里是**可选**的
+      # （runner 具备 ARM64 工具集时会一并构建并暂存，缺了也不算失败；发布路径的强制
+      # 要求设在 installer job 的 staging 步骤）。
+      - name: Stage bundle resources (helper + frida gadget; arm64 optional here)
+        run: node scripts/stage-bundle-inputs.cjs
+
+      - name: Test Rust workspace
+        run: cargo test --workspace
+
+      # arm64 助手的编译路径必须被真实覆盖：本机与部分环境没有 VS ARM64 工具集，
+      # 那条路径平时永远不会被执行到（issue206 的根因之一）。
+      # `cargo check` 只做类型检查并产出元数据，**不调用链接器**，因此不依赖
+      # Microsoft.VisualStudio.Component.VC.Tools.ARM64；真正需要该组件的是 installer
+      # job 的 staging 步骤（`cargo build --target aarch64-pc-windows-msvc`）。
+      - name: Check RC003 helper compiles for Windows on ARM (aarch64)
+        run: cargo check --target aarch64-pc-windows-msvc --manifest-path hardware/RC003/helper/Cargo.toml
+
+      - name: Check Windows Tauri host
+        run: cargo check --workspace
+
+      - name: Build Windows runtime simulation
+        shell: pwsh
+        run: |
+          $env:VITE_SAYALL_RUNTIME_SIMULATION = "1"
+          pnpm tauri build --no-bundle --features runtime-simulation
+
+      # 防回归（2026-10-03 本机实证）：补丁 build.frontendDist 误用 Windows 绝对路径时，
+      # tauri 会把它当单字母 scheme 的 URL，前端资源不嵌入、界面变成目录列表，
+      # 而哈希/签名/内嵌修订号全部正常——只有对 exe 做“资源键是否在二进制里”的检查才能发现。
+      - name: Verify frontend assets are embedded in the executable
+        shell: pwsh
+        run: ./scripts/verify-frontend-embedded.ps1
+
+      - name: Test Windows Tauri WebView and IPC runtime simulation
+        shell: pwsh
+        timeout-minutes: 3
+        run: ./scripts/test-windows-runtime-simulation.ps1
+
+  # 安装器构建与生命周期矩阵只在合入 main 后或人工点跑时执行。
+  # PR 仍由 verify 覆盖前端、Rust 和 runtime simulation，避免每次提交都重复
+  # 构建 NSIS 并执行耗时的安装、升级、降级和卸载测试。
+  installer:
+    name: Verify Windows installer lifecycle
+    needs: verify
+    if: >-
+      needs.verify.result == 'success' &&
+      github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # staging 要 **构建** arm64 助手（cargo build --target aarch64-...），因此本
+          # job 也必须装 aarch64 目标；链接器由 windows-2025 镜像自带的 VS ARM64
+          # 工具集提供（见下方 staging 步骤的注释）。
+          targets: aarch64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Ensure updater signing key (CI fallback for missing secret)
+        shell: pwsh
+        run: ./scripts/ensure-updater-signing-key.ps1
+
+      # arm64 双载荷（2026-10-07 issue206）：默认 src-tauri/tauri.conf.json 只声明 x64
+      # 两件，因为 tauri-build 在**编译期**校验资源存在，而 arm64 助手需要 VS 的
+      # Microsoft.VisualStudio.Component.VC.Tools.ARM64 才能构建（本机没有它 ⇒ 写进
+      # 默认配置会让任何 cargo check / cargo test 都直接失败）。
+      # windows-2025 托管镜像自带 ARM64 构建工具（actions/runner-images 的 Windows2025
+      # 组件表里 Microsoft.VisualStudio.Component.VC.Tools.ARM64 在列），因此发布路径
+      # **强制**要求 arm64 载荷：这里设 SAYALL_REQUIRE_ARM64_PAYLOAD=1，缺失即让 staging
+      # 非零退出，不允许静默产出一个在 Windows 11 ARM64 上缺载荷的安装包。
+      - name: Stage bundle resources (helper + frida gadget, x64 + arm64)
+        env:
+          SAYALL_REQUIRE_ARM64_PAYLOAD: "1"
+        run: node scripts/stage-bundle-inputs.cjs
+
+      - name: Build predecessor NSIS upgrade fixture
+        shell: pwsh
+        run: ./scripts/build-windows-upgrade-fixture.ps1
+
+      # arm64 覆盖配置（tauri 的 --config 可重复，按 RFC 7396 顺序合并，数组整体覆盖）：
+      # staging 已保证四件载荷都在 src-tauri/，这里把 bundle.resources 覆盖成四件。
+      - name: Build unsigned NSIS preview installer
+        run: pnpm tauri build --bundles nsis --config src-tauri/tauri.arm64-payload.conf.json
+
+      # 防回归（2026-10-03 本机实证）：见 verify job 中同名步骤的注释。
+      - name: Verify frontend assets are embedded in the executable
+        shell: pwsh
+        run: ./scripts/verify-frontend-embedded.ps1
+
+      - name: Verify runtime simulation is absent from production build
+        shell: pwsh
+        run: ./scripts/verify-runtime-simulation-isolation.ps1
+
+      - name: Verify installer identity and create checksums
+        shell: pwsh
+        run: ./scripts/verify-windows-bundle.ps1
+
+      - name: Test install upgrade downgrade and uninstall matrix
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./scripts/test-windows-install-lifecycle-matrix.ps1
+
+      - name: Test silent current-user install and uninstall
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./scripts/test-windows-silent-install.ps1
+
+      - name: Test installer graceful exit while the app is running
+        shell: pwsh
+        timeout-minutes: 12
+        run: ./scripts/test-windows-installer-graceful-exit.ps1
+
+      - name: Upload unsigned preview installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: sayall-windows-unsigned-preview-${{ github.sha }}
+          path: artifacts/windows-preview/
+          if-no-files-found: error
+          retention-days: 14

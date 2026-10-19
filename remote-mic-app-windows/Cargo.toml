@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/sayall-core",
+    "crates/sayall-windows",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+# 应用版本号的唯一来源是 src-tauri/tauri.conf.json 的 `version`（安装包名、exe 版本
+# 资源、关于页显示与更新器比较全部由它决定）。这里的 0.0.0 只是内部 crate 的占位值，
+# 不参与任何用户可见产物——不要在此维护版本号，也不要把 config 的 version 删掉。
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/GetSayAll/remote-mic-app-windows"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

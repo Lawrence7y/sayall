@@ -1,0 +1,17 @@
+# Dependencies and build output
+node_modules/
+target/
+dist/
+dist-build/
+build/
+.gradle/
+__pycache__/
+*.pyc
+*.log
+
+# Compiled binaries
+*.exe
+*.dll
+*.pdb
+*.o
+*.a

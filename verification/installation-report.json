@@ -1,0 +1,28 @@
+{
+  "Status": "installed-and-running",
+  "InstallPath": "D:\\无线麦 SayAll\\sayall-windows-app.exe",
+  "SHA256": "C49977B45AF7EC8EDEC2D01A7E38B530F13A76040D4F230C9302F6B101752E7C",
+  "BackupPath": "D:\\Project\\sayall\\backups\\install-20261010-182316",
+  "PID": 38648,
+  "ConfigurationFiles": [
+    {
+      "File": "button-mappings.json",
+      "Unchanged": true
+    },
+    {
+      "File": "onboarding.json",
+      "Unchanged": true
+    },
+    {
+      "File": "settings.json",
+      "Unchanged": true
+    },
+    {
+      "File": "voice-hold-hotkey.json",
+      "Unchanged": true
+    }
+  ],
+  "WindowRelease": "passed: WebView2 process count 0 after closing",
+  "Reopen": "passed: same main PID, frontend IPC ready",
+  "VoiceInput": "deferred: no physical voice input test"
+}

@@ -1,0 +1,131 @@
+# 无线麦 SayAll Windows 日志规范
+
+本规范把参考仓库中已验证的日志经验适配到 Windows。它适用于 BLE、HID、按键注入、WASAPI、输入法、Tauri IPC、更新器、安装器和诊断摘要。
+
+## 基本原则
+
+- 日志是功能的一部分。新增、修改或修复功能时，同时设计、实现并验证从入口到用户可见结果的完整链路。
+- `received`、`decoded`、`enqueued`、`submitted` 只表示中间事实，不能冒充最终成功。
+- 事实、未知状态和推测分开记录；无法观察第三方 App 内部状态时写 `unknown` 或 `diagnostic_boundary`，不得猜测。
+- 同一次操作使用进程内短生命周期的 `operation_id`、`attempt_id`、`generation` 关联；一次操作只能有一个终态。
+- 时间戳使用 UTC ISO 8601 毫秒精度；耗时使用单调时钟并输出整数毫秒。
+
+## 行格式与诊断头
+
+每行至少包含：
+
+```text
+2026-09-08T03:19:26.123Z pid=1234 ver=0.2.1 build=42 BLE CONNECT phase=completed result=passed
+```
+
+字段使用小写 `snake_case`，枚举使用稳定英文值。诊断摘要至少包含：
+
+```text
+diagnostic_schema=1
+app_version=0.2.1
+app_build=42
+source_revision=<完整 SHA 或 unknown>
+build_channel=stable|pr_preview|local|unknown
+release_tag=v0.2.1|none|unknown
+process_id=1234
+process_architecture=x86_64|unknown
+windows_version=<版本或 unknown>
+windows_build=<build 或 unknown>
+```
+
+构建时写入 `source_revision`，运行时不得读取 Git 工作区。无法可靠取得的值写 `unknown`，不能省略字段。
+
+正式应用默认写入 `%LOCALAPPDATA%\SayAll\Logs\sayall-diagnostic.log`，不再要求用户
+预先设置环境变量。受控测试仍可用 `SAYALL_GATT_LOG` 覆盖写入位置；日志正文不得
+打印实际文件路径。应用启动、Tauri setup、前端入口、Vue 挂载和首次 IPC 读取必须
+在用户看到主页面前后分别留痕，确保安装后白屏可以区分为宿主、WebView、脚本、
+Vue 渲染或 IPC 阶段故障。
+
+### 单一日志文件：主程序 + 提权助手（2026-10-01）
+
+RC003 提权助手的日志**与主程序写进同一个文件**，报障收集只要求用户提供一份日志。
+链路：主程序在桥接描述文件里发布 `log=<主程序诊断日志路径>` → 助手读到后把行写进
+同一文件（行首为 UTC ISO 8601 毫秒时间戳 + `pid=<助手进程号> component=rc003-helper`）。
+助手与该文件之间是"整行单次 `write_all` 追加"，主程序侧按行读取不受影响。
+
+- 描述文件缺 `log=`（旧版主程序）→ 助手按约定回退 `<描述文件目录>\Logs\sayall-diagnostic.log`；
+- 两者都不可写 → 回退助手自己的 `%ProgramData%\SayAll\rc003-helper\helper-task.log`，
+  并在该文件里记 `[LOG] event=helper_local_fallback`（回退绝不静默）；
+- 助手行**落盘前统一脱敏**：`%USERPROFILE%` / `%LOCALAPPDATA%`（含 `\AppData\Local` 形态）/
+  `%APPDATA%` / `%ProgramData%`，另抹掉 `C:\Users\<用户名>`。
+
+### 轮转与体积上限：单个文件不超过 10 MB（2026-10-08）
+
+- **硬上限**：任何单个诊断日志文件不得超过 **10 MB**。写入前按「当前大小 + 本次长度 > 10 MB」
+  判断；超过就把当前文件改名成 `<主名>-<UTC 时间戳>-p<进程号>.log`，再新建当前文件继续写。
+- **保留份数**：轮转文件保留最近 **5 份**（不含当前文件），更旧的按文件名里的时间戳序列删除；
+  总量上限约 60 MB。
+- **两个写入方共用同一份"当前文件"**（见上一节）。实现上刻意"无长句柄"——每次追加都重新
+  打开文件；任一进程轮转之后，另一方下一次写入自然落到新文件，不会继续写进已被改名的旧文件。
+  代码在 `crates/sayall-windows/src/diagnostic_log.rs` 与 `hardware/RC003/helper/src/main.rs`
+  两处（分属不同 workspace，无法共享代码）——**改上限/份数时两处必须一起改**。
+- **心跳节流**：
+  - 助手 `[HB]`：只在**状态变化**时或每 **30 s** 落一条（原来逐条落盘、实测约 2 条/秒，是日志膨胀主因）；
+  - 主程序诊断心跳：**只在无线麦窗口处于前台时**记录，**10 s** 一条（2026-10-08 用户要求；
+    前台判定只比较进程号，不记录窗口标题/类名等窗口身份）。应用在后台时没有周期状态行——
+    这是有意取舍：后台的静默停摆改由事件行与 `capture_inactive` 一类判据行体现。
+  - 心跳的用途是"证明进程还活着 + 保留趋势计数"，不是逐次留痕；高频重复相同日志本来就违反
+    上一节「状态未变化时不得重复刷相同日志」。
+- **体积实测（2026-10-08）**：治理前单机累计 768 MB、约 107 MB/天（助手 `[HB]` 逐条为主因）；
+  治理后健康态实测约 **3 MB/天**（主程序心跳行 406 B、助手 `[HB]` 行 618 B）。按 10 MB/文件
+  轮转，约每 3 天一个文件，保留 5 份 ⇒ 约 50 MB 封顶、约半个月历史。
+
+### 实时路径异步写盘（2026-10-12）
+
+主程序的 GATT / 按键 / 菜单日志先提交到 2048 条有界队列，由单一后台线程按 FIFO
+逐行调用原有轮转写入器；生产启动时预建线程。提交不等待磁盘，路径与时间戳在提交时
+固定，仍保留每行重新打开文件的跨进程轮转语义，助手写入方式不变。
+
+队列满时不阻塞输入线程，记录丢弃数量，后续写入输出
+`component=diagnostic_log event=queue_overflow dropped=...`。因此日志提交成功不表示已落盘。
+受控日志读取和应用退出前调用 `flush_diagnostic_log(timeout)` 等待此前已受理行；超时或
+写入失败返回 false。强杀/崩溃仍可能丢失尚未写入的队列尾部；正常退出显式最多等待 2 秒。
+该取舍不得被描述为日志零丢失或遥控器通信带宽提升。
+
+### 普通快捷键回声诊断：非阻塞观察
+
+普通按键注入不等待回声。立即有读数时记录 `phase=immediate`；钩子存活但
+未读到时记录 `phase=echo_pending operation_id=...`，现有输入引擎在 60 ms
+观察预算到期后只读一次并记录同一 `operation_id`。最多保留 64 条，容量满时
+记录 `phase=echo_skipped reason=diagnostic_capacity`；退出记录
+`phase=cancelled reason=shutdown`，不补发动作。观察结束后没有周期诊断唤醒。
+
+读数必须注明 `scope=global_hook_window`：全局注入计数可能包含其他进程或
+后续动作，不能作为本次快捷键的精确 ACK；`result=queued` 仍不表示前台收到了
+按键。取消和容量满也不代表输入失败，只表示诊断未完成。
+
+## 必需事件链
+
+每项功能按实际存在的边界记录：
+
+1. 请求进入及来源分类；
+2. 前置条件、权限和设备/端点选择；
+3. 状态机接受或拒绝；
+4. WinRT、WASAPI、SendInput 或 IPC 调用开始与返回；
+5. 数据到达、解析、验证和路由；
+6. 下游消费、提交和真正用户可见结果；
+7. 取消、断连、超时、重试、恢复和迟到回调；
+8. 唯一 `terminal_result` 及总耗时。
+
+失败应带 `error_domain`、`error_code`、`reason` 和 `retryable=true|false`。状态未变化时不得重复刷相同日志；高频 HID、音频包和轮询只记录首尾、聚合计数、字节/帧数、丢弃数量和耗时。
+
+## 隐私红线
+
+不得记录语音或转写正文、用户输入、剪贴板、用户名/邮箱/手机号、完整路径、窗口标题、蓝牙 MAC/UUID/序列号、HID 路径、IP、Token/API Key/密码/私钥/证书、第三方 App 私有状态或原始音频字节。不要用敏感值的稳定哈希替代脱敏。允许记录稳定产品分类、布尔结果、错误 domain/code、采样率、帧数、耗时和脱敏计数。
+
+生产日志不得记录原始音频包；GATT 音频只在会话终态聚合帧数、样本数、丢弃数
+和耗时。音频端点只记录 `virtual_cable|bluetooth|other` 分类及计数，不记录名称、
+端点 ID 或蓝牙身份。
+
+## 评审清单
+
+- [ ] 入口、前置检查、跨组件交接和最终结果均有日志。
+- [ ] 成功、失败、取消、超时、重试、恢复和 stale callback 可区分。
+- [ ] 异步提交与真实完成分开记录，且一次操作只有一个终态。
+- [ ] 日志不包含个人信息、设备身份、路径、凭据、用户内容或第三方私有数据。
+- [ ] 已覆盖自动化、Windows 真机和第三方工具的验证边界。

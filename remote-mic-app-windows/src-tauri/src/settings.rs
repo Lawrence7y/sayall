@@ -1,0 +1,1359 @@
+use sayall_core::{
+    normalize_gain_db, AppIconIdentifier, AppSettings, ThemePreference, UsageStatistics,
+    VoiceInputTool,
+};
+use sayall_windows::send_input::{
+    ButtonMappings, KeyChord, KeyCode, BUTTON_MAPPINGS_SCHEMA_VERSION,
+};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::onboarding::{self, OnboardingState, OnboardingStep};
+
+#[derive(Debug, Clone)]
+pub struct SettingsStore {
+    path: PathBuf,
+    access: Arc<Mutex<()>>,
+}
+
+const BUTTON_MAPPING_EXPORT_VERSION: u32 = 1;
+const MAX_BUTTON_MAPPING_IMPORT_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ButtonMappingConfiguration {
+    format_version: u32,
+    button_mappings: ButtonMappings,
+}
+
+impl SettingsStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            access: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn load(&self) -> Result<AppSettings, String> {
+        let _guard = lock(&self.access);
+        self.load_unlocked()
+    }
+
+    fn load_unlocked(&self) -> Result<AppSettings, String> {
+        let contents = match fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(AppSettings::default()),
+            Err(error) => return Err(format!("读取应用设置失败：{error}")),
+        };
+        parse_settings(&contents)
+    }
+
+    pub fn save_audio_endpoint(
+        &self,
+        endpoint_id: String,
+        endpoint_name: String,
+    ) -> Result<(), String> {
+        self.update("保存音频端点设置", move |settings| {
+            settings.audio_endpoint_id = Some(endpoint_id);
+            settings.audio_endpoint_name = Some(endpoint_name);
+        })
+    }
+
+    pub fn save_selected_remote_id(&self, device_id: String) -> Result<(), String> {
+        self.update("保存小米语音遥控器设置", move |settings| {
+            settings.selected_remote_id = Some(device_id);
+        })
+    }
+
+    pub fn save_check_prerelease_updates(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存预览版更新设置", move |settings| {
+            settings.check_prerelease_updates = enabled;
+        })
+    }
+
+    pub fn save_launch_at_login(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存开机自启动设置", move |settings| {
+            settings.launch_at_login = enabled;
+        })
+    }
+
+    /// RC003 三键增强捕获的用户意图（按键页开关，默认关闭）。
+    pub fn save_rc003_capture_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存三键增强捕获开关", move |settings| {
+            settings.rc003_capture_enabled = enabled;
+        })
+    }
+
+    pub fn save_theme_preference(&self, preference: ThemePreference) -> Result<(), String> {
+        self.update("保存外观设置", move |settings| {
+            settings.theme_preference = preference;
+        })
+    }
+
+    /// 应用图标（设置页「应用图标」，2026-10-02）。
+    pub fn save_app_icon(&self, identifier: AppIconIdentifier) -> Result<(), String> {
+        self.update("保存应用图标设置", move |settings| {
+            settings.app_icon = identifier;
+        })
+    }
+
+    /// 连接页选择的输入工具（None = 从未选择，由界面按当前快捷键推断后落存）。
+    pub fn save_voice_input_tool(&self, tool: Option<VoiceInputTool>) -> Result<(), String> {
+        self.update("保存输入工具设置", move |settings| {
+            settings.voice_input_tool = tool;
+        })
+    }
+
+    /// 首次使用向导状态（`onboarding.json`，设计稿 §6）。
+    ///
+    /// 第一次调用执行一次性迁移判定并落盘，必须在任何其他设置写入之前调用
+    /// （Tauri setup 最前段）。之后每次读取都返回已持久化的状态，不重写。
+    pub fn ensure_onboarding_state(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        self.ensure_onboarding_state_unlocked()
+    }
+
+    fn ensure_onboarding_state_unlocked(&self) -> Result<OnboardingState, String> {
+        let path = onboarding::state_path(&self.path);
+        match fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str::<OnboardingState>(&contents) {
+                Ok(state) => Ok(state.normalized()),
+                Err(_) => {
+                    // 损坏状态：保守修复（有旧安装证据按老用户、否则全新开始），
+                    // 立即重写为有效文件，绝不静默丢弃成"没走过向导"。
+                    let repaired = onboarding::resolve_initial_state(
+                        onboarding::install_evidence_exists(&self.path),
+                    );
+                    self.write_onboarding_state(&repaired)?;
+                    sayall_windows::gatt_note(format!(
+                        "onboarding event=migration phase=completed result=passed source={} reason=state_repaired_from_corrupt completed_version={}",
+                        if repaired.completed_version > 0 {
+                            "existing_install"
+                        } else {
+                            "fresh_install"
+                        },
+                        repaired.completed_version
+                    ));
+                    Ok(repaired)
+                }
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // 全新安装 vs 老用户升级：只看配置目录里有没有旧安装证据，
+                // 一次性 migration_version 防止第二次启动误判（设计稿 §6.2）。
+                let evidence = onboarding::install_evidence_exists(&self.path);
+                let state = onboarding::resolve_initial_state(evidence);
+                self.write_onboarding_state(&state)?;
+                sayall_windows::gatt_note(format!(
+                    "onboarding event=migration phase=completed result=passed source={} completed_version={} migration_version={}",
+                    if evidence { "existing_install" } else { "fresh_install" },
+                    state.completed_version,
+                    state.migration_version
+                ));
+                Ok(state)
+            }
+            Err(error) => {
+                sayall_windows::gatt_note(
+                    "onboarding event=state_read phase=completed terminal_result=failed error_domain=settings error_code=read_failed reason=state_file_unreadable retryable=true".to_owned(),
+                );
+                Err(format!("读取向导状态失败：{error}"))
+            }
+        }
+    }
+
+    /// 持久化当前步骤。步骤未变化时不重写、不重复刷日志。
+    pub fn save_onboarding_step(&self, step: OnboardingStep) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        if state.step != step {
+            state.step = step;
+            state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+            self.write_onboarding_state(&state)?;
+            sayall_windows::gatt_note(format!(
+                "onboarding event=step_persisted step={}",
+                state.step.as_str()
+            ));
+        }
+        Ok(state)
+    }
+
+    /// 设置页「重新运行设置向导」：先回滚未提交的 staged 绑定，再重置向导进度；
+    /// 不清除设备/映射/音频/其他设置。
+    pub fn restart_onboarding(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        self.restore_onboarding_staged_binding_unlocked("wizard_restart")?;
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        state.step = OnboardingStep::Welcome;
+        state.completed_version = 0;
+        state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+        self.write_onboarding_state(&state)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=restarted flow_version={}",
+            state.flow_version
+        ));
+        Ok(state)
+    }
+
+    /// 完成向导：提交 staged 事务（保留当前正式值、清除回滚快照）并标记完成。
+    pub fn complete_onboarding(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        if let Some(staged) = state.staged.take() {
+            sayall_windows::gatt_note(format!(
+                "onboarding event=binding action=verified tool={} hotkey_count={}",
+                crate::voice_input_tool_name(staged.tool),
+                staged
+                    .voice_hotkey
+                    .as_ref()
+                    .map(|chord| chord.keys.len())
+                    .unwrap_or(0)
+            ));
+        }
+        state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+        state.completed_version = state.flow_version;
+        self.write_onboarding_state(&state)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=completed flow_version={}",
+            state.flow_version
+        ));
+        Ok(state)
+    }
+
+    fn write_onboarding_state(&self, state: &OnboardingState) -> Result<(), String> {
+        let path = onboarding::state_path(&self.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                log_onboarding_write_failure("create_dir_failed", true);
+                format!("创建应用设置目录失败：{error}")
+            })?;
+        }
+        let contents = serde_json::to_vec_pretty(state).map_err(|error| {
+            log_onboarding_write_failure("serialize_failed", false);
+            format!("序列化向导状态失败：{error}")
+        })?;
+        fs::write(&path, contents).map_err(|error| {
+            log_onboarding_write_failure("file_write_failed", true);
+            format!("保存向导状态失败：{error}")
+        })
+    }
+
+    /// 语音增益（dB，0–24，对齐 Mac `gainDB` 的持久化口径）。
+    ///
+    /// 越界与非有限值在这里钳制后落盘，并返回实际保存值供界面显示：
+    /// 界面滑块与配置文件的取值从此只有一种语义（0 = 原始音量）。
+    pub fn save_gain_db(&self, gain_db: f32) -> Result<f32, String> {
+        let normalized = normalize_gain_db(gain_db);
+        self.update("保存增益设置", move |settings| {
+            settings.gain_db = normalized;
+        })?;
+        Ok(normalized)
+    }
+
+    pub fn usage_statistics(&self) -> Result<UsageStatistics, String> {
+        self.load().map(|settings| settings.usage_statistics)
+    }
+
+    /// 暂存语音绑定（第④步选输入工具）：先落回滚快照，再应用正式值。
+    ///
+    /// 必须在向导进行中调用；快照只取**第一次**进入事务时的正式值（后续换工具
+    /// 不覆盖回滚基线）。持久化顺序：快照先写、正式值后写——中途崩溃也不会
+    /// 丢失回滚目标（设计稿 §5.4 / §6）。运行时应用（platform）由命令层负责。
+    pub fn stage_onboarding_voice_binding(
+        &self,
+        tool: VoiceInputTool,
+        hotkey: Option<KeyChord>,
+    ) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        if !state.is_active() {
+            return Err("首次设置向导未在进行中".to_owned());
+        }
+        let staged = match state.staged.clone() {
+            Some(existing) => onboarding::OnboardingStagedBinding {
+                tool: Some(tool),
+                voice_hotkey: hotkey.clone(),
+                revert_tool: existing.revert_tool,
+                revert_voice_hotkey: existing.revert_voice_hotkey,
+            },
+            None => onboarding::OnboardingStagedBinding {
+                tool: Some(tool),
+                voice_hotkey: hotkey.clone(),
+                revert_tool: self.load_unlocked()?.voice_input_tool,
+                revert_voice_hotkey: self.load_voice_hold_hotkey_unlocked()?,
+            },
+        };
+        state.staged = Some(staged.clone());
+        self.write_onboarding_state(&state)?;
+        self.update_unlocked("保存输入工具设置", move |settings| {
+            settings.voice_input_tool = Some(tool);
+        })?;
+        self.save_voice_hold_hotkey_unlocked(hotkey)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=binding action=staged tool={} hotkey_count={} revert_tool={} revert_hotkey_count={}",
+            crate::voice_input_tool_name(Some(tool)),
+            staged
+                .voice_hotkey
+                .as_ref()
+                .map(|chord| chord.keys.len())
+                .unwrap_or(0),
+            crate::voice_input_tool_name(staged.revert_tool),
+            staged
+                .revert_voice_hotkey
+                .as_ref()
+                .map(|chord| chord.keys.len())
+                .unwrap_or(0)
+        ));
+        Ok(state)
+    }
+
+    /// 回滚并清除 staged 事务（启动恢复 / 重跑向导用）。返回是否处理了事务。
+    ///
+    /// 写序：先把回滚值写回正式配置，成功后才清除快照——中途失败时快照保留，
+    /// 下次启动重试（幂等）。已完成状态下残留快照只清除、不动正式配置。
+    pub fn restore_onboarding_staged_binding(&self, reason: &str) -> Result<bool, String> {
+        let _guard = lock(&self.access);
+        self.restore_onboarding_staged_binding_unlocked(reason)
+    }
+
+    fn restore_onboarding_staged_binding_unlocked(&self, reason: &str) -> Result<bool, String> {
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        let Some(staged) = state.staged.clone() else {
+            return Ok(false);
+        };
+        if state.is_active() {
+            self.update_unlocked("恢复输入工具设置", move |settings| {
+                settings.voice_input_tool = staged.revert_tool;
+            })?;
+            self.save_voice_hold_hotkey_unlocked(staged.revert_voice_hotkey.clone())?;
+            sayall_windows::gatt_note(format!(
+                "onboarding event=binding action=restored reason={reason} tool={} hotkey_count={}",
+                crate::voice_input_tool_name(staged.revert_tool),
+                staged
+                    .revert_voice_hotkey
+                    .as_ref()
+                    .map(|chord| chord.keys.len())
+                    .unwrap_or(0)
+            ));
+        } else {
+            // 异常组合（已完成却留有未提交快照）：只清快照，不动正式配置。
+            sayall_windows::gatt_note(format!(
+                "onboarding event=binding action=cleared reason={reason}_state_inconsistent"
+            ));
+        }
+        state.staged = None;
+        self.write_onboarding_state(&state)?;
+        Ok(true)
+    }
+
+    pub fn record_usage(
+        &self,
+        local_date: String,
+        button_presses: u64,
+        voice_sessions: u64,
+        voice_seconds: f64,
+    ) -> Result<(), String> {
+        if button_presses == 0 && voice_sessions == 0 && voice_seconds <= 0.0 {
+            return Ok(());
+        }
+        self.update("保存本机使用统计", move |settings| {
+            settings
+                .usage_statistics
+                .record_button_presses(&local_date, button_presses);
+            settings.usage_statistics.record_voice_sessions(
+                &local_date,
+                voice_sessions,
+                voice_seconds,
+            );
+        })
+    }
+
+    pub fn load_button_mappings(&self) -> Result<ButtonMappings, String> {
+        let _guard = lock(&self.access);
+        let path = self.button_mappings_path();
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(ButtonMappings::default())
+            }
+            Err(error) => return Err(format!("读取按键映射失败：{error}")),
+        };
+        // 文件由更高版本写入：本版本拒绝加载（normalized 报错），但先把原始
+        // 内容留一份旁证，避免用户在本版本里保存时覆盖掉更高版本的数据
+        // （2026-10-05 评审发现 3）。
+        if let Some(version) = button_mappings_schema_version(&contents) {
+            if version > u64::from(BUTTON_MAPPINGS_SCHEMA_VERSION) {
+                let backup = path.with_extension(format!("json.v{version}.bak"));
+                if !backup.exists() {
+                    let _ = fs::copy(&path, &backup);
+                }
+                sayall_windows::gatt_note(format!(
+                    "button_mappings schema_version={version} supported_max={BUTTON_MAPPINGS_SCHEMA_VERSION} action=backup backup_file={}",
+                    backup
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("unknown")
+                ));
+            }
+        }
+        serde_json::from_str::<ButtonMappings>(&contents)
+            .map_err(|error| format!("解析按键映射失败：{error}"))?
+            // 旧文件（结构版本 < 1）按旧版自动连发行为迁移为显式开关，
+            // 再统一校验并盖章为当前版本。
+            .migrate_legacy_hold_repeat()
+            .normalized()
+            .map_err(|error| format!("按键映射无效：{error}"))
+    }
+
+    pub fn save_button_mappings(&self, mappings: ButtonMappings) -> Result<ButtonMappings, String> {
+        let _guard = lock(&self.access);
+        let mappings = mappings
+            .normalized()
+            .map_err(|error| format!("按键映射无效：{error}"))?;
+        let path = self.button_mappings_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
+        }
+        let contents = serde_json::to_vec_pretty(&mappings)
+            .map_err(|error| format!("序列化按键映射失败：{error}"))?;
+        fs::write(path, contents).map_err(|error| format!("保存按键映射失败：{error}"))?;
+        Ok(mappings)
+    }
+
+    pub fn export_button_mappings(
+        &self,
+        path: &Path,
+        mappings: ButtonMappings,
+    ) -> Result<(), String> {
+        // 与加载/导入同一口径：旧结构先迁移再校验盖章，避免把 v0 直接写成
+        // v1 却丢掉「旧版自动连发」语义（2026-10-05 评审发现 4）。
+        let mappings = mappings
+            .migrate_legacy_hold_repeat()
+            .normalized()
+            .map_err(|error| format!("按键映射无效：{error}"))?;
+        let configuration = ButtonMappingConfiguration {
+            format_version: BUTTON_MAPPING_EXPORT_VERSION,
+            button_mappings: mappings,
+        };
+        // serde_json::Value 的对象键按序输出，使同一配置便于比对和版本管理。
+        let value = serde_json::to_value(configuration)
+            .map_err(|error| format!("序列化按键映射配置失败：{error}"))?;
+        let contents = serde_json::to_vec_pretty(&value)
+            .map_err(|error| format!("序列化按键映射配置失败：{error}"))?;
+        fs::write(path, contents).map_err(|error| format!("写入按键映射配置失败：{error}"))
+    }
+
+    pub fn import_button_mappings(&self, path: &Path) -> Result<ButtonMappings, String> {
+        let metadata =
+            fs::metadata(path).map_err(|error| format!("读取按键映射配置失败：{error}"))?;
+        if metadata.len() > MAX_BUTTON_MAPPING_IMPORT_BYTES {
+            return Err("按键映射配置文件过大".to_owned());
+        }
+        let contents = fs::read(path).map_err(|error| format!("读取按键映射配置失败：{error}"))?;
+        let configuration: ButtonMappingConfiguration = serde_json::from_slice(&contents)
+            .map_err(|error| format!("解析按键映射配置失败：{error}"))?;
+        if configuration.format_version != BUTTON_MAPPING_EXPORT_VERSION {
+            return Err(format!(
+                "不支持的按键映射配置版本：{}",
+                configuration.format_version
+            ));
+        }
+        // 完整解析并规范化通过后才触碰应用配置，实现失败不改变现状。
+        // 旧导出（无显式开关）走与本地加载相同的迁移。
+        self.save_button_mappings(configuration.button_mappings.migrate_legacy_hold_repeat())
+    }
+
+    pub fn load_voice_hold_hotkey(&self) -> Result<Option<KeyChord>, String> {
+        let _guard = lock(&self.access);
+        self.load_voice_hold_hotkey_unlocked()
+    }
+
+    /// v1 默认按住说话快捷键：左 Ctrl + 左 Win（适配微信输入法的默认语音热键）。
+    pub fn default_voice_hold_hotkey() -> Option<KeyChord> {
+        Some(KeyChord {
+            keys: vec![
+                sayall_windows::send_input::KeyCode::LeftControl,
+                sayall_windows::send_input::KeyCode::LeftWindows,
+            ],
+        })
+    }
+
+    fn load_voice_hold_hotkey_unlocked(&self) -> Result<Option<KeyChord>, String> {
+        let path = self.voice_hold_hotkey_path();
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(Self::default_voice_hold_hotkey())
+            }
+            Err(error) => return Err(format!("读取按住说话快捷键失败：{error}")),
+        };
+        serde_json::from_str::<Option<KeyChord>>(&contents)
+            .map_err(|error| format!("解析按住说话快捷键失败：{error}"))
+    }
+
+    pub fn save_voice_hold_hotkey(
+        &self,
+        hotkey: Option<KeyChord>,
+    ) -> Result<Option<KeyChord>, String> {
+        let _guard = lock(&self.access);
+        self.save_voice_hold_hotkey_unlocked(hotkey)
+    }
+
+    fn save_voice_hold_hotkey_unlocked(
+        &self,
+        hotkey: Option<KeyChord>,
+    ) -> Result<Option<KeyChord>, String> {
+        if let Some(chord) = &hotkey {
+            chord
+                .clone()
+                .validated()
+                .map_err(|error| format!("按住说话快捷键无效：{error}"))?;
+        }
+        let path = self.voice_hold_hotkey_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
+        }
+        let contents = serde_json::to_vec_pretty(&hotkey)
+            .map_err(|error| format!("序列化按住说话快捷键失败：{error}"))?;
+        fs::write(path, contents).map_err(|error| format!("保存按住说话快捷键失败：{error}"))?;
+        Ok(hotkey)
+    }
+
+    /// 「其他工具」面板记住的按键（2026-10-01 Andy 反馈：选了「不按键 / 左 Alt」
+    /// 之后切去豆包再切回来，会退回默认的右 Alt——因为选中别的工具会改写
+    /// 按住说话快捷键，而「其他工具」没有自己的记忆）。
+    ///
+    /// `None` = 从未选过（保持现状）；`Some(vec![])` = 明确选了「不按键」。
+    pub fn load_other_voice_hotkey(&self) -> Result<Option<Vec<KeyCode>>, String> {
+        let _guard = lock(&self.access);
+        let path = self.other_voice_hotkey_path();
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("读取「其他工具」按键记忆失败：{error}")),
+        };
+        serde_json::from_str::<Option<Vec<KeyCode>>>(&contents)
+            .map_err(|error| format!("解析「其他工具」按键记忆失败：{error}"))
+    }
+
+    pub fn save_other_voice_hotkey(
+        &self,
+        keys: Option<Vec<KeyCode>>,
+    ) -> Result<Option<Vec<KeyCode>>, String> {
+        let _guard = lock(&self.access);
+        if let Some(keys) = &keys {
+            if !keys.is_empty() {
+                KeyChord { keys: keys.clone() }
+                    .validated()
+                    .map_err(|error| format!("「其他工具」按键无效：{error}"))?;
+            }
+        }
+        let path = self.other_voice_hotkey_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
+        }
+        let contents = serde_json::to_vec_pretty(&keys)
+            .map_err(|error| format!("序列化「其他工具」按键记忆失败：{error}"))?;
+        fs::write(path, contents)
+            .map_err(|error| format!("保存「其他工具」按键记忆失败：{error}"))?;
+        Ok(keys)
+    }
+
+    fn button_mappings_path(&self) -> PathBuf {
+        self.path.with_file_name("button-mappings.json")
+    }
+
+    fn voice_hold_hotkey_path(&self) -> PathBuf {
+        self.path.with_file_name("voice-hold-hotkey.json")
+    }
+
+    fn other_voice_hotkey_path(&self) -> PathBuf {
+        self.path.with_file_name("other-voice-hotkey.json")
+    }
+
+    fn update(&self, operation: &str, update: impl FnOnce(&mut AppSettings)) -> Result<(), String> {
+        let _guard = lock(&self.access);
+        self.update_unlocked(operation, update)
+    }
+
+    fn update_unlocked(
+        &self,
+        operation: &str,
+        update: impl FnOnce(&mut AppSettings),
+    ) -> Result<(), String> {
+        let mut settings = self.load_unlocked()?;
+        settings.schema_version = AppSettings::default().schema_version;
+        update(&mut settings);
+        let contents = serialize_settings(&settings)?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
+        }
+        fs::write(&self.path, contents).map_err(|error| format!("{operation}失败：{error}"))
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn log_onboarding_write_failure(reason: &str, retryable: bool) {
+    sayall_windows::gatt_note(format!(
+        "onboarding event=state_write phase=completed terminal_result=failed error_domain=settings error_code=write_failed reason={reason} retryable={retryable}"
+    ));
+}
+
+fn parse_settings(contents: &str) -> Result<AppSettings, String> {
+    serde_json::from_str(contents)
+        .map(AppSettings::normalized)
+        .map_err(|error| format!("解析应用设置失败：{error}"))
+}
+
+fn serialize_settings(settings: &AppSettings) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(settings).map_err(|error| format!("序列化应用设置失败：{error}"))
+}
+
+/// 按键映射文件里的结构版本号（缺省或非法均为 None）。
+fn button_mappings_schema_version(contents: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(contents)
+        .ok()?
+        .get("schemaVersion")?
+        .as_u64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn other_voice_hotkey_memory_distinguishes_never_chosen_from_no_key() {
+        // 「其他工具」的记忆必须能区分「从未选过」（None）与「明确选了不按键」（Some(vec![])）。
+        let store = SettingsStore::new(std::env::temp_dir().join("sayall-other-hotkey-test.json"));
+        assert_eq!(store.load_other_voice_hotkey().unwrap(), None);
+        assert_eq!(
+            store.save_other_voice_hotkey(Some(Vec::new())).unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(store.load_other_voice_hotkey().unwrap(), Some(Vec::new()));
+        let keys = vec![KeyCode::LeftAlt];
+        store.save_other_voice_hotkey(Some(keys.clone())).unwrap();
+        assert_eq!(store.load_other_voice_hotkey().unwrap(), Some(keys));
+        let _ = std::fs::remove_file(store.path.with_file_name("other-voice-hotkey.json"));
+    }
+
+    #[test]
+    fn settings_round_trip_preserves_stable_endpoint_identity() {
+        let mut usage_statistics = UsageStatistics::default();
+        usage_statistics.record_button_presses("2026-09-01", 3);
+        usage_statistics.record_voice_sessions("2026-09-01", 2, 4.5);
+        let settings = AppSettings {
+            selected_remote_id: Some("test-remote-id".to_owned()),
+            audio_endpoint_id: Some("test-endpoint-id".to_owned()),
+            audio_endpoint_name: Some("CABLE Input (Test)".to_owned()),
+            gain_db: 6.0,
+            usage_statistics,
+            ..AppSettings::default()
+        };
+
+        let encoded = serialize_settings(&settings).unwrap();
+        let decoded = parse_settings(std::str::from_utf8(&encoded).unwrap()).unwrap();
+
+        assert_eq!(decoded, settings);
+    }
+
+    #[test]
+    fn settings_load_preserves_non_audio_preferences() {
+        let decoded = parse_settings(
+            r#"{"schema_version":1,"audio_endpoint_id":"endpoint","audio_endpoint_name":"Endpoint Name","gain_db":12.0,"voice_trigger_mode":"hold","launch_at_login":true,"open_window_at_launch":false}"#,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.audio_endpoint_id.as_deref(), Some("endpoint"));
+        assert_eq!(
+            decoded.audio_endpoint_name.as_deref(),
+            Some("Endpoint Name")
+        );
+        assert_eq!(decoded.gain_db, 12.0);
+        assert!(decoded.launch_at_login);
+        assert!(!decoded.open_window_at_launch);
+        assert!(!decoded.check_prerelease_updates);
+        assert_eq!(decoded.theme_preference, ThemePreference::System);
+    }
+
+    /// 2026-10-04 迁移（用户定稿）：旧代次配置里的 `app_icon` 只是旧版本写下的默认值，
+    /// 升级后一律改用几何鸭；在新版本里做出的选择落盘后保持（真机现场：旧包写下的
+    /// `standard` 曾让窗口/托盘/快捷方式停在旧图标）。
+    #[test]
+    fn app_icon_migrates_from_old_schema_and_keeps_new_choice() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-app-icon-migration-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{"schema_version":3,"gain_db":0.0,"voice_trigger_mode":"hold","app_icon":"standard"}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::new(path.clone());
+
+        // 旧配置读出来 = 几何鸭。
+        assert_eq!(
+            store.load().unwrap().app_icon,
+            AppIconIdentifier::FacetedDuck
+        );
+
+        // 新版本里选择「默认」并落盘：带新代次，之后读回保持。
+        store.save_app_icon(AppIconIdentifier::Standard).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // 配置文件是 pretty JSON（键冒号后有空格），用解析而不是子串比对。
+        let persisted: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(persisted["schema_version"], serde_json::json!(4));
+        assert_eq!(persisted["app_icon"], serde_json::json!("standard"));
+        assert_eq!(store.load().unwrap().app_icon, AppIconIdentifier::Standard);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn theme_preference_defaults_to_system_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-theme-preference-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        assert_eq!(
+            store.load().unwrap().theme_preference,
+            ThemePreference::System
+        );
+        store.save_theme_preference(ThemePreference::Dark).unwrap();
+        assert_eq!(
+            store.load().unwrap().theme_preference,
+            ThemePreference::Dark
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prerelease_update_preference_defaults_off_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-update-preference-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        assert!(!store.load().unwrap().check_prerelease_updates);
+        store.save_check_prerelease_updates(true).unwrap();
+        assert!(store.load().unwrap().check_prerelease_updates);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn voice_input_tool_defaults_to_unset_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-voice-input-tool-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        // 老配置 / 新装：未选择过 → None（界面据此推断一次，不替用户猜）。
+        assert_eq!(store.load().unwrap().voice_input_tool, None);
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Doubao))
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Doubao)
+        );
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Other))
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Other)
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn audio_gain_defaults_to_zero_and_persists_clamped() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-audio-gain-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        // 新装 / 老配置：默认 0 dB（原始音量）。
+        assert_eq!(store.load().unwrap().gain_db, 0.0);
+
+        assert_eq!(store.save_gain_db(12.0).unwrap(), 12.0);
+        assert_eq!(store.load().unwrap().gain_db, 12.0);
+
+        // 越界与非法值：按 0–24 dB 钳制后落盘，并返回实际保存值（界面显示同源）。
+        assert_eq!(store.save_gain_db(30.0).unwrap(), 24.0);
+        assert_eq!(store.load().unwrap().gain_db, 24.0);
+        assert_eq!(store.save_gain_db(f32::NAN).unwrap(), 0.0);
+        assert_eq!(store.load().unwrap().gain_db, 0.0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn launch_at_login_defaults_off_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-launch-at-login-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        assert!(!store.load().unwrap().launch_at_login);
+        store.save_launch_at_login(true).unwrap();
+        assert!(store.load().unwrap().launch_at_login);
+        store.save_launch_at_login(false).unwrap();
+        assert!(!store.load().unwrap().launch_at_login);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn button_mapping_json_round_trip_preserves_typed_shortcut() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::{
+            ButtonAction, ButtonActions, ButtonTrigger, KeyChord, KeyCode,
+        };
+
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Control, KeyCode::Enter],
+                    },
+                },
+                double: ButtonAction::Disabled,
+                long: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Escape],
+                    },
+                },
+                hold_repeat: None,
+                ok_context_click: false,
+            },
+        );
+        let encoded = serde_json::to_string(&mappings).unwrap();
+        let decoded: ButtonMappings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, mappings);
+        assert_eq!(
+            decoded.action_for(RemoteButton::Ok, ButtonTrigger::Single),
+            ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Control, KeyCode::Enter],
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn exported_button_mapping_configuration_is_stable_versioned_and_rejects_before_mutation() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
+
+        let base = std::env::temp_dir().join(format!(
+            "sayall-test-button-mapping-config-{}",
+            std::process::id()
+        ));
+        let settings_path = base.join("settings.json");
+        let export_path = base.join("mapping.json");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(settings_path);
+        let mut mappings = ButtonMappings::default();
+        mappings
+            .applications
+            .push(sayall_windows::app_launcher::CustomAppPick {
+                name: "Example".into(),
+                path: "shell:AppsFolder\\Example!App".into(),
+            });
+        mappings.actions.insert(
+            RemoteButton::Power,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Escape],
+                    },
+                },
+                double: ButtonAction::Disabled,
+                long: ButtonAction::Disabled,
+                hold_repeat: None,
+                ok_context_click: false,
+            },
+        );
+
+        store
+            .export_button_mappings(&export_path, mappings.clone())
+            .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&export_path).unwrap()).unwrap();
+        assert_eq!(exported["formatVersion"], 1);
+        assert!(exported.get("buttonMappings").is_some());
+        let first_export = std::fs::read(&export_path).unwrap();
+        store
+            .export_button_mappings(&export_path, mappings.clone())
+            .unwrap();
+        assert_eq!(std::fs::read(&export_path).unwrap(), first_export);
+        assert_eq!(
+            store.import_button_mappings(&export_path).unwrap(),
+            mappings
+        );
+
+        std::fs::write(
+            &export_path,
+            br#"{"formatVersion":99,"buttonMappings":{"enabled":false,"actions":{}}}"#,
+        )
+        .unwrap();
+        assert!(store.import_button_mappings(&export_path).is_err());
+        assert_eq!(store.load_button_mappings().unwrap(), mappings);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn voice_hold_hotkey_round_trips_and_validates_chord() {
+        let store = SettingsStore::new(std::env::temp_dir().join(format!(
+            "sayall-test-voice-hold-{}.json",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_file(store.voice_hold_hotkey_path());
+
+        // 缺省文件 = v1 默认（左 Ctrl + 左 Win）
+        let default = store.load_voice_hold_hotkey().unwrap();
+        assert_eq!(default, SettingsStore::default_voice_hold_hotkey());
+        assert_eq!(
+            default.unwrap().keys,
+            vec![
+                sayall_windows::send_input::KeyCode::LeftControl,
+                sayall_windows::send_input::KeyCode::LeftWindows,
+            ]
+        );
+
+        let right_alt = KeyChord {
+            keys: vec![sayall_windows::send_input::KeyCode::RightAlt],
+        };
+        let saved = store
+            .save_voice_hold_hotkey(Some(right_alt.clone()))
+            .unwrap();
+        assert_eq!(saved, Some(right_alt.clone()));
+        assert_eq!(store.load_voice_hold_hotkey().unwrap(), Some(right_alt));
+
+        let disabled = store.save_voice_hold_hotkey(None).unwrap();
+        assert_eq!(disabled, None);
+        assert_eq!(store.load_voice_hold_hotkey().unwrap(), None);
+
+        let invalid = KeyChord { keys: vec![] };
+        assert!(store.save_voice_hold_hotkey(Some(invalid)).is_err());
+
+        let _ = std::fs::remove_file(store.voice_hold_hotkey_path());
+    }
+
+    fn onboarding_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sayall-test-onboarding-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn onboarding_fresh_install_starts_at_welcome_and_is_idempotent() {
+        let base = onboarding_test_dir("fresh");
+        let store = SettingsStore::new(base.join("settings.json"));
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert!(state.is_active());
+        assert_eq!(state.step, OnboardingStep::Welcome);
+        assert_eq!(state.flow_version, onboarding::CURRENT_FLOW_VERSION);
+        assert_eq!(
+            state.migration_version,
+            onboarding::CURRENT_MIGRATION_VERSION
+        );
+        assert!(onboarding::state_path(&store.path).exists());
+
+        // 二次调用幂等：不重写、不重置进度。
+        let again = store.ensure_onboarding_state().unwrap();
+        assert_eq!(state, again);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_existing_install_is_migrated_to_completed() {
+        let base = onboarding_test_dir("existing");
+        let store = SettingsStore::new(base.join("settings.json"));
+        std::fs::write(
+            base.join("settings.json"),
+            r#"{"schema_version":3,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert!(!state.is_active());
+        assert_eq!(state.completed_version, onboarding::CURRENT_FLOW_VERSION);
+
+        // 第二次启动仍是完成态（一次性迁移位防止误判）。
+        let again = store.ensure_onboarding_state().unwrap();
+        assert!(!again.is_active());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_corrupt_state_is_repaired_conservatively() {
+        // 有旧安装证据：按老用户修复，重写为有效文件。
+        let base = onboarding_test_dir("repair-existing");
+        let store = SettingsStore::new(base.join("settings.json"));
+        std::fs::write(base.join("settings.json"), "{}").unwrap();
+        std::fs::write(onboarding::state_path(&store.path), "not json").unwrap();
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert!(!state.is_active());
+        let repaired: OnboardingState = serde_json::from_str(
+            &std::fs::read_to_string(onboarding::state_path(&store.path)).unwrap(),
+        )
+        .unwrap();
+        assert!(!repaired.is_active());
+
+        // 无任何证据：按全新修复，从欢迎开始。
+        let base2 = onboarding_test_dir("repair-fresh");
+        let store2 = SettingsStore::new(base2.join("settings.json"));
+        std::fs::write(onboarding::state_path(&store2.path), "not json").unwrap();
+        let state2 = store2.ensure_onboarding_state().unwrap();
+        assert!(state2.is_active());
+        assert_eq!(state2.step, OnboardingStep::Welcome);
+
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base2);
+    }
+
+    #[test]
+    fn onboarding_unknown_step_in_file_normalizes_to_welcome_without_losing_completion() {
+        let base = onboarding_test_dir("unknown-step");
+        let store = SettingsStore::new(base.join("settings.json"));
+        std::fs::write(
+            onboarding::state_path(&store.path),
+            r#"{"flow_version":1,"completed_version":1,"step":"legacy_step","migration_version":1}"#,
+        )
+        .unwrap();
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert_eq!(state.step, OnboardingStep::Welcome);
+        assert!(!state.is_active());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_step_save_restart_and_complete_lifecycle() {
+        let base = onboarding_test_dir("lifecycle");
+        let store = SettingsStore::new(base.join("settings.json"));
+
+        store
+            .save_onboarding_step(OnboardingStep::VoiceTest)
+            .unwrap();
+        assert_eq!(
+            store.ensure_onboarding_state().unwrap().step,
+            OnboardingStep::VoiceTest
+        );
+
+        let restarted = store.restart_onboarding().unwrap();
+        assert!(restarted.is_active());
+        assert_eq!(restarted.step, OnboardingStep::Welcome);
+
+        let completed = store.complete_onboarding().unwrap();
+        assert!(!completed.is_active());
+        assert_eq!(
+            completed.completed_version,
+            onboarding::CURRENT_FLOW_VERSION
+        );
+        // 完成后再次读取不被重置，重启也不会重新激活。
+        assert!(!store.ensure_onboarding_state().unwrap().is_active());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_staged_binding_snapshots_once_applies_formal_and_restores() {
+        let base = onboarding_test_dir("staged-binding");
+        let store = SettingsStore::new(base.join("settings.json"));
+        let right_alt = KeyChord {
+            keys: vec![KeyCode::RightAlt],
+        };
+
+        // 迁移判定先行（全新 → 进行中）；再模拟"老用户完成过、又主动重跑向导"：
+        // 正式配置是他之前的选择，重跑后进入 active，staged 应以此为回滚基线。
+        assert!(store.ensure_onboarding_state().unwrap().is_active());
+        store.complete_onboarding().unwrap();
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        store
+            .save_voice_hold_hotkey(SettingsStore::default_voice_hold_hotkey())
+            .unwrap();
+        assert!(store.restart_onboarding().unwrap().is_active());
+
+        // 第一次暂存：应用正式值，并记录回滚基线。
+        let state = store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, Some(right_alt.clone()))
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Doubao)
+        );
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            Some(right_alt.clone())
+        );
+        let staged = state.staged.clone().unwrap();
+        assert_eq!(staged.revert_tool, Some(VoiceInputTool::Wechat));
+        assert_eq!(
+            staged.revert_voice_hotkey,
+            SettingsStore::default_voice_hold_hotkey()
+        );
+
+        // 二次暂存（换工具）：回滚基线保持第一次的值，不被覆盖。
+        store
+            .stage_onboarding_voice_binding(VoiceInputTool::Vokie, None)
+            .unwrap();
+        let staged = store.ensure_onboarding_state().unwrap().staged.unwrap();
+        assert_eq!(staged.revert_tool, Some(VoiceInputTool::Wechat));
+        assert_eq!(
+            staged.revert_voice_hotkey,
+            SettingsStore::default_voice_hold_hotkey()
+        );
+        assert_eq!(store.load_voice_hold_hotkey().unwrap(), None);
+
+        // 回滚：正式配置恢复、快照清除；再次回滚是幂等空操作。
+        assert!(store
+            .restore_onboarding_staged_binding("test_restore")
+            .unwrap());
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Wechat)
+        );
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            SettingsStore::default_voice_hold_hotkey()
+        );
+        assert!(store.ensure_onboarding_state().unwrap().staged.is_none());
+        assert!(!store
+            .restore_onboarding_staged_binding("test_restore_again")
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_stage_requires_active_flow() {
+        let base = onboarding_test_dir("stage-inactive");
+        let store = SettingsStore::new(base.join("settings.json"));
+        store.complete_onboarding().unwrap();
+
+        assert!(store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, None)
+            .is_err());
+        assert!(!store
+            .restore_onboarding_staged_binding("test_inactive")
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_restart_rolls_back_staged_binding_before_reset() {
+        let base = onboarding_test_dir("restart-rollback");
+        let store = SettingsStore::new(base.join("settings.json"));
+        assert!(store.ensure_onboarding_state().unwrap().is_active());
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        store
+            .stage_onboarding_voice_binding(
+                VoiceInputTool::Doubao,
+                Some(KeyChord {
+                    keys: vec![KeyCode::RightAlt],
+                }),
+            )
+            .unwrap();
+
+        let state = store.restart_onboarding().unwrap();
+        assert!(state.is_active());
+        assert_eq!(state.step, OnboardingStep::Welcome);
+        assert!(state.staged.is_none());
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Wechat)
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_complete_commits_staged_binding_values() {
+        let base = onboarding_test_dir("complete-commit");
+        let store = SettingsStore::new(base.join("settings.json"));
+        let right_alt = KeyChord {
+            keys: vec![KeyCode::RightAlt],
+        };
+        assert!(store.ensure_onboarding_state().unwrap().is_active());
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, Some(right_alt.clone()))
+            .unwrap();
+
+        let state = store.complete_onboarding().unwrap();
+        assert!(!state.is_active());
+        assert!(state.staged.is_none());
+        // 提交：保留暂存时应用的正式值（验证通过后的最终状态）。
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Doubao)
+        );
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            Some(right_alt.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn legacy_button_mapping_file_migrates_hold_repeat_on_load() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::ButtonTrigger;
+
+        let base = std::env::temp_dir().join(format!(
+            "sayall-test-legacy-hold-repeat-{}",
+            std::process::id()
+        ));
+        let settings_path = base.join("settings.json");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(settings_path);
+
+        // 旧版文件：无 schemaVersion / holdRepeat。back=删除（旧版会自动
+        // 连续），ok=Enter（无连发区间）。
+        let mappings_path = store.button_mappings_path();
+        std::fs::create_dir_all(mappings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mappings_path,
+            r#"{"enabled":true,"actions":{"back":{"single":{"type":"shortcut","chord":{"keys":["delete"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}},"ok":{"single":{"type":"shortcut","chord":{"keys":["enter"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load_button_mappings().unwrap();
+        assert_eq!(loaded.schema_version, 1, "加载即盖章为当前版本");
+        assert_eq!(
+            loaded.actions(RemoteButton::Back).hold_repeat,
+            Some(ButtonTrigger::Single),
+            "旧版自动连续的按键迁移为显式开关"
+        );
+        assert_eq!(
+            loaded.actions(RemoteButton::Ok).hold_repeat,
+            None,
+            "无连发区间键不迁移"
+        );
+
+        // 用户显式关闭后保存：再次加载不得被重新打开。
+        let mut edited = loaded.clone();
+        edited
+            .actions
+            .get_mut(&RemoteButton::Back)
+            .unwrap()
+            .hold_repeat = None;
+        store.save_button_mappings(edited).unwrap();
+        let reloaded = store.load_button_mappings().unwrap();
+        assert_eq!(
+            reloaded.actions(RemoteButton::Back).hold_repeat,
+            None,
+            "显式关闭不得被重新推断"
+        );
+
+        // 旧版导出（不含新字段）导入同样走迁移。
+        let legacy_export = base.join("legacy-export.json");
+        std::fs::write(
+            &legacy_export,
+            r#"{"formatVersion":1,"buttonMappings":{"enabled":true,"actions":{"back":{"single":{"type":"shortcut","chord":{"keys":["delete"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}}"#,
+        )
+        .unwrap();
+        let imported = store.import_button_mappings(&legacy_export).unwrap();
+        assert_eq!(
+            imported.actions(RemoteButton::Back).hold_repeat,
+            Some(ButtonTrigger::Single),
+            "旧导出导入按加载同一规则迁移"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn load_backs_up_button_mappings_from_a_newer_schema() {
+        let base = std::env::temp_dir().join("sayall-button-mappings-newer-schema");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(base.join("app-settings.json"));
+        let path = store.button_mappings_path();
+        let newer = r#"{"schemaVersion":9,"enabled":true,"actions":{"up":{"single":{"type":"shortcut","chord":{"keys":["delete"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}"#;
+        std::fs::write(&path, newer).unwrap();
+
+        assert!(
+            store.load_button_mappings().is_err(),
+            "更高版本必须拒绝加载（不降级）"
+        );
+        // 原始内容必须先留旁证：本版本随后保存也不至于覆盖更高版本的数据。
+        let backup = path.with_extension("json.v9.bak");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), newer);
+
+        // 重复加载幂等：旁证不被重写，原文件保持不动。
+        assert!(store.load_button_mappings().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), newer);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn export_migrates_legacy_hold_repeat_like_load_and_import() {
+        let base = std::env::temp_dir().join("sayall-button-mappings-export-migrate");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(base.join("app-settings.json"));
+        let legacy: ButtonMappings = serde_json::from_str(
+            r#"{"enabled":true,"actions":{"back":{"single":{"type":"shortcut","chord":{"keys":["delete"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}"#,
+        )
+        .unwrap();
+
+        let target = base.join("export.json");
+        store.export_button_mappings(&target, legacy).unwrap();
+        let exported = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            exported.contains("\"holdRepeat\": \"single\""),
+            "导出必须与加载/导入同一迁移口径：{exported}"
+        );
+        assert!(
+            exported.contains("\"schemaVersion\": 1"),
+            "导出统一写当前结构版本：{exported}"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+}

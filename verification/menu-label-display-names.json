@@ -1,0 +1,24 @@
+﻿[
+    {
+        "direction":  "right",
+        "action":  "open_app",
+        "displayName":  "DeepSeek Harness"
+    },
+    {
+        "direction":  "left",
+        "action":  "open_app",
+        "displayName":  "ChatGPT"
+    },
+    {
+        "direction":  "down",
+        "action":  "open_app",
+        "displayName":  "性能监视器"
+    },
+    {
+        "direction":  "up",
+        "action":  "twinkle_cycle_monitor",
+        "displayName":  {
+
+                        }
+    }
+]
